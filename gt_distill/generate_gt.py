@@ -57,6 +57,7 @@ def generate_ground_truth(path_to_segment, model, force=False):
 
     for img in input_frames:
         img = np.expand_dims(img.astype(np.float32), axis=0)
+        # model outputs
         outs = model.run(None, {'input_imgs': img, 'desire': desire, 'traffic_convention': tc, 'initial_state': recurrent_state})[0]
 
         results = extract_preds(outs, best_plan_only=False)[0]
