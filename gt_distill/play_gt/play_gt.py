@@ -45,18 +45,33 @@ def calib_frame_to_full_frame(in_x, in_y, in_z):
   y = -in_y * 1 + 580
   x = x*0.5 + 270
 
-  # device_frame_from_view_frame = np.array([
-  #   [ 0.,  0.,  1.],
-  #   [ 1.,  0.,  0.],
-  #   [ 0.,  1.,  0.]
-  # ])
-  # view_frame_from_device_frame = device_frame_from_view_frame.T
+  device_frame_from_view_frame = np.array([
+    [ 0.,  0.,  1.],
+    [ 1.,  0.,  0.],
+    [ 0.,  1.,  0.]
+  ])
+  view_frame_from_device_frame = device_frame_from_view_frame.T
   # RPY_INIT = np.array([0.0,0.0,0.0])
-  # self.rpys = np.tile(self.rpy, (INPUTS_WANTED, 1))
-  # rpys = self.rpys[valid_idxs]
-  # smooth_rpy = np.mean(rpys, axis=0)
-  # rpyCalib = smooth_rpy.tolist()
-  # rpyCalib = np.asarray(rpyCalib)
+
+  # reset
+  RPY_INIT = np.array([0.0,0.0,0.0])
+  self_rpy = RPY_INIT.copy()
+  self_block_idx = 0
+  self_valid_blocks = 0
+  
+  INPUTS_WANTED = 50   # We want a little bit more than we need for stability
+  self_rpys = np.tile(self_rpy, (INPUTS_WANTED, 1))
+  self_block_idx += 1
+  self_valid_blocks = max(self_block_idx, self_valid_blocks)
+  self_block_idx = self_block_idx % INPUTS_WANTED
+  before_current = list(range(self_block_idx))
+  after_current = list(range(min(self_valid_blocks, self_block_idx + 1), self_valid_blocks))
+  valid_idxs = before_current + after_current
+  rpys = self_rpys[valid_idxs]
+  self_rpy = np.mean(rpys, axis=0)
+  smooth_rpy = np.mean(rpys, axis=0)
+  rpyCalib = smooth_rpy.tolist()
+  rpyCalib = np.asarray(rpyCalib)
   # device_from_calib= orient.rot_from_euler([rpyCalib[0], rpyCalib[1], rpyCalib[2]])
   # view_from_calib = view_frame_from_device_frame.dot(device_from_calib)
   ep = matvecmul3(view_from_calib, [in_x, in_y, in_z])
