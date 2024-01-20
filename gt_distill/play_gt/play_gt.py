@@ -21,6 +21,10 @@ FCAM_INTRINSIC_MATRIX = [2648.0, 0.0, 1928.0 / 2,
                                            0.0, 2648.0, 1208.0 / 2,
                                            0.0, 0.0, 1.0]
 
+# view_from_calib = [ 0.0001, 0.0000125, 0.002, 
+#                    0.0, 0.0, 0.01, 
+#                    .01, 0.005, 0.05 ] # [x,x,x,y,y,y,z,z,z]
+
 view_from_calib = [ 0.0, 1.0, 0.0, 
                    0.0, 0.0, 1.0, 
                    1.0, .4, 0.0 ]
@@ -36,6 +40,7 @@ def calib_frame_to_full_frame(in_x, in_y, in_z):
   # pt = [[in_x, in_y, in_z]]
   # Ep = matvecmul3(10, pt)
   # KEp = matvecmul3(FCAM_INTRINSIC_MATRIX, Ep)
+  print(f"xyz: {in_x} {in_y} {in_z}")
   x = in_x * 20 + 600
   y = -in_y * 1 + 580
   x = x*0.5 + 270
@@ -46,6 +51,8 @@ def calib_frame_to_full_frame(in_x, in_y, in_z):
   #   [ 0.,  1.,  0.]
   # ])
   # view_frame_from_device_frame = device_frame_from_view_frame.T
+  # RPY_INIT = np.array([0.0,0.0,0.0])
+  # self.rpys = np.tile(self.rpy, (INPUTS_WANTED, 1))
   # rpys = self.rpys[valid_idxs]
   # smooth_rpy = np.mean(rpys, axis=0)
   # rpyCalib = smooth_rpy.tolist()
@@ -53,10 +60,13 @@ def calib_frame_to_full_frame(in_x, in_y, in_z):
   # device_from_calib= orient.rot_from_euler([rpyCalib[0], rpyCalib[1], rpyCalib[2]])
   # view_from_calib = view_frame_from_device_frame.dot(device_from_calib)
   ep = matvecmul3(view_from_calib, [in_x, in_y, in_z])
+  print(f"ep: {str(ep)}")
   kep = matvecmul3(FCAM_INTRINSIC_MATRIX, ep)
+  print(f"kep: {str(kep)}")
   # x = kep[0] / kep[2]
   y = kep[1] / kep[2]
-
+  print(f"xyz_out: {x} {y}")
+  # return [in_x*(in_y/10)+600,(in_y*-1+550)/1.0]
   return [x,y]
 
 def get_polygon_points(points, idx):
