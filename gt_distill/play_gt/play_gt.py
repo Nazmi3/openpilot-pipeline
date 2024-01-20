@@ -7,6 +7,7 @@ from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
 from PyQt5.QtWidgets import QApplication, QLabel, QMainWindow, QVBoxLayout, QWidget
 import sys
 import math
+# import common.transformations.orientation as orient
 
 # model outputs slices
 class Plan:
@@ -39,8 +40,18 @@ def calib_frame_to_full_frame(in_x, in_y, in_z):
   y = -in_y * 1 + 580
   x = x*0.5 + 270
 
-  
-
+  # device_frame_from_view_frame = np.array([
+  #   [ 0.,  0.,  1.],
+  #   [ 1.,  0.,  0.],
+  #   [ 0.,  1.,  0.]
+  # ])
+  # view_frame_from_device_frame = device_frame_from_view_frame.T
+  # rpys = self.rpys[valid_idxs]
+  # smooth_rpy = np.mean(rpys, axis=0)
+  # rpyCalib = smooth_rpy.tolist()
+  # rpyCalib = np.asarray(rpyCalib)
+  # device_from_calib= orient.rot_from_euler([rpyCalib[0], rpyCalib[1], rpyCalib[2]])
+  # view_from_calib = view_frame_from_device_frame.dot(device_from_calib)
   ep = matvecmul3(view_from_calib, [in_x, in_y, in_z])
   kep = matvecmul3(FCAM_INTRINSIC_MATRIX, ep)
   # x = kep[0] / kep[2]
