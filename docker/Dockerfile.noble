@@ -1,0 +1,45 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Prerequisites op.sh setup relies on (build tools, git, git-lfs, file, curl, locales)
+# plus the OpenGL/X11 runtime libs raylib/pyray need during `scons` (font gen etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      build-essential \
+      curl \
+      libcurl4-openssl-dev \
+      git \
+      git-lfs \
+      file \
+      sudo \
+      locales \
+      python3 \
+      libgl1 \
+      libglu1-mesa \
+      libglib2.0-0 \
+      libx11-6 \
+      libxext6 \
+      libxrandr2 \
+      libxinerama1 \
+      libxcursor1 \
+      libxi6 \
+    && git lfs install --system \
+    && locale-gen en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Miniconda (for separate conda envs; openpilot itself uses the uv-managed .venv).
+# auto_activate_base is disabled so `base` doesn't shadow the openpilot venv.
+ENV CONDA_DIR=/opt/miniconda3
+RUN curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+    && bash /tmp/miniconda.sh -b -p "$CONDA_DIR" \
+    && rm -f /tmp/miniconda.sh \
+    && "$CONDA_DIR/bin/conda" init bash \
+    && "$CONDA_DIR/bin/conda" config --set auto_activate_base false \
+    && "$CONDA_DIR/bin/conda" clean -afy
+ENV PATH=$CONDA_DIR/condabin:$PATH
+
+WORKDIR /app
+CMD ["sleep", "infinity"]
