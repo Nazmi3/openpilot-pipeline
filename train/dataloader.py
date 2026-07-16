@@ -59,26 +59,43 @@ def load_transformed_video(path_to_segment, plot_img_width=640, plot_img_height=
     yuv_frame2 = bgr_to_yuv(frame2)
     yuv_frames[0] = yuv_frame2
 
+    # number of frames actually read (may be < seq_len if the video is shorter)
+    frames_read = 0
+
     # start iteration from 1 because we already read 1 frame before
     for t_idx in range(1, seq_len + 1):
 
         ret, frame2 = segment_video.read()
         if not ret:
-            print('Failed to read video from {}'.format(path_to_video))
-            return None, None
+            # End of video reached before seq_len frames: truncate gracefully
+            # instead of failing, so shorter clips still produce a valid video.
+            print('Reached end of video {} after {} frames (requested {}).'.format(
+                path_to_video, t_idx - 1, seq_len))
+            break
 
         yuv_frame2 = bgr_to_yuv(frame2)
         rgb_frame =  cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
 
         rgb_frames[t_idx-1] = create_image_canvas(rgb_frame, CALIB_BB_TO_FULL, plot_img_height, plot_img_width)
         yuv_frames[t_idx] = yuv_frame2
+        frames_read = t_idx
+
+    segment_video.release()
+
+    if frames_read == 0:
+        print('Failed to read video from {}'.format(path_to_video))
+        return None, None
+
+    # keep only the frames we actually read
+    rgb_frames = rgb_frames[:frames_read]
+    yuv_frames = yuv_frames[:frames_read + 1]
+    stacked_frames = stacked_frames[:frames_read]
 
     prepared_frames = transform_frames(yuv_frames)
 
-    for i in range(seq_len):
+    for i in range(frames_read):
         stacked_frames[i] = np.vstack(prepared_frames[i:i+2])[None].reshape(12, 128, 256)
 
-    segment_video.release()
     return torch.from_numpy(stacked_frames).float(), rgb_frames
 
 

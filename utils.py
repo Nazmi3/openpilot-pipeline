@@ -379,6 +379,40 @@ def create_image_canvas(img_rgb, zoom_matrix, plot_img_height, plot_img_width):
     return img_plot
 
 
+# Calibration used when visualizing model predictions *during training*
+# (see train.visualization). Predictions come out of the model in the
+# calibrated frame of reference, so they are rendered with zero
+# roll/pitch/yaw. Keep this here as the single source of truth so any
+# offline visualization (e.g. the prediction-video test) matches training.
+TRAIN_VIZ_CALIB_RPY = [0.0, 0.0, 0.0]
+
+# Laneline colors used for prediction visualization during training.
+LANELINE_COLORS = [(255, 0, 0), (0, 255, 0), (255, 0, 255), (0, 255, 255)]
+
+
+def draw_visualization(lanelines, road_edges, calib_path, im_rgb,
+                       rpy_calib=None, plot_img_width=640, plot_img_height=480,
+                       lane_line_color_list=None, **draw_path_kwargs):
+    '''Render one frame of model predictions onto an RGB image.
+
+    This mirrors exactly what ``train.visualization`` does during training,
+    using the same calibration source (``TRAIN_VIZ_CALIB_RPY``) so that
+    offline visualizations are directly comparable to the wandb videos
+    logged while training.
+
+    ``calib_path`` is the plan tensor of shape (2, 33, 15); only the mean
+    x/y/z of the best path (``calib_path[0, :, :3]``) is drawn.
+    '''
+    if rpy_calib is None:
+        rpy_calib = TRAIN_VIZ_CALIB_RPY
+    if lane_line_color_list is None:
+        lane_line_color_list = LANELINE_COLORS
+
+    calibration_pred = Calibration(rpy_calib, plot_img_width=plot_img_width, plot_img_height=plot_img_height)
+    return draw_path(lanelines, road_edges, calib_path[0, :, :3], im_rgb,
+                     calibration_pred, lane_line_color_list, **draw_path_kwargs)
+
+
 def draw_path(lane_lines, road_edges, path_plan, img_plot, calibration, lane_line_color_list, width=1, height=1.22, fill_color=(128, 0, 255), line_color=(0, 255, 0)):
     
     '''Draw model predictions on an image.'''    

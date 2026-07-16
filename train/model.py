@@ -63,16 +63,21 @@ def load_inference_model(path_to_model):
     elif path_to_model.endswith('.pth'):
 
         model = load_trainable_model(ORIGINAL_MODEL)
-        model.load_state_dict(torch.load(path_to_model))
+        # map_location=device so a checkpoint saved on GPU still loads on
+        # CPU-only hosts (the test-video launcher runs inference on CPU to
+        # sidestep GPU-arch/torch-version compat issues on newer hardware).
+        model.load_state_dict(torch.load(path_to_model, map_location=device))
         model.eval()
         model = model.to(device)
 
         def run_model(inputs):
             with torch.no_grad():
                 inputs = {k: torch.from_numpy(v).to(device) for k, v in inputs.items()}
-                outs = model(**inputs)
+                outs = model(**inputs).cpu().numpy()
+                # return numpy recurrent state, consistent with the .onnx branch,
+                # so callers can refeed it directly as the next 'initial_state'
                 recurrent_state = outs[:, -512:]
-                return outs.cpu().numpy(), recurrent_state
+                return outs, recurrent_state
 
     return model, run_model
 

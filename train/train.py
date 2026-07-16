@@ -16,7 +16,7 @@ from dataloader import CommaDataset, BatchDataLoader, BackgroundGenerator, load_
 from torch.utils.data import DataLoader
 import wandb
 from timing import Timing, MultiTiming, pprint_stats
-from utils import Calibration, draw_path, printf, extract_preds, extract_gt, load_h5, dir_path
+from utils import Calibration, draw_path, draw_visualization, printf, extract_preds, extract_gt, load_h5, dir_path
 import os
 from model import load_trainable_model
 import gc
@@ -36,15 +36,12 @@ def pprint_seconds(seconds):
 
 
 # visualizing the model predictions
+# Thin wrapper kept for backwards-compatibility; the actual logic (and the
+# calibration source) now lives in utils.draw_visualization so that offline
+# tools reuse the exact same code path as training.
 def visualization(lanelines, roadedges, calib_path, im_rgb):
-    plot_img_height, plot_img_width = 480, 640
-
-    rpy_calib = [0, 0, 0]
-    calibration_pred = Calibration(rpy_calib, plot_img_width=plot_img_width, plot_img_height=plot_img_height)
-    laneline_colors = [(255, 0, 0), (0, 255, 0), (255, 0, 255), (0, 255, 255)]
-    vis_image = draw_path(lanelines, roadedges, calib_path[0, :, :3], im_rgb, calibration_pred, laneline_colors)
-
-    return vis_image
+    return draw_visualization(lanelines, roadedges, calib_path, im_rgb,
+                              plot_img_width=640, plot_img_height=480)
 
 def mean_std(array, eps=1e-10):
     mean = array[:, 0, :, :]

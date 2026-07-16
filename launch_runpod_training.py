@@ -31,6 +31,8 @@ python launch_runpod_training.py --list                       # discover volumes
 python launch_runpod_training.py --date-it run1 --epochs 15               # create + train
 python launch_runpod_training.py --date-it run1 --epochs 15 --auto-stop   # + stop pod when done
 python launch_runpod_training.py --date-it run1 --epochs 15 --wait        # + download model & DELETE pod
+python launch_runpod_training.py --date-it run1 --epochs 15 --wait --snpe-sdk-url <url>  # + auto-convert to .dlc
+python launch_runpod_training.py --date-it run1 --convert-only --wait     # convert existing .pth -> .onnx/.dlc, no retrain
 python launch_runpod_training.py --gen-gt --date-it fullrun --wait        # full GT, train, download, delete
 python launch_runpod_training.py --no-train                   # just provision, no training
 
@@ -44,39 +46,20 @@ import subprocess
 import sys
 import time
 
-# ---------------------------- CONFIG (env-overridable) ----------------------------
-VOLUME_ID   = os.environ.get("RUNPOD_VOLUME_ID", "z4zbwcmpuv")  # 'military_salmon_marsupial' (comma2k19)
-DATA_CENTER = os.environ.get("RUNPOD_DC", "EUR-IS-1")           # MUST match the volume's region
-GPU_TYPE    = os.environ.get("RUNPOD_GPU", "NVIDIA RTX 4000 Ada Generation")
-# Fallback GPUs (all comfortably fit this small model, ~6GB). Tried in order in
-# the SAME data center as the volume until one has availability. Cheaper first.
-GPU_CANDIDATES = [
-    "NVIDIA RTX 4000 Ada Generation",
-    "NVIDIA RTX 2000 Ada Generation",
-    "NVIDIA RTX A4000",
-    "NVIDIA RTX 4000 SFF Ada Generation",
-    "NVIDIA RTX A4500",
-    "NVIDIA L4",
-    "NVIDIA RTX A5000",
-    "NVIDIA RTX 5000 Ada Generation",
-    "NVIDIA A40",
-    "NVIDIA L40S",
-    "NVIDIA L40",
-    "NVIDIA RTX A6000",
-    "NVIDIA RTX 6000 Ada Generation",
-    "NVIDIA GeForce RTX 4090",
-    "NVIDIA A100 80GB PCIe",
-]
-IMAGE       = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
-CONTAINER_DISK_GB = 30
-MOUNT_PATH  = "/workspace"
+# Shared RunPod plumbing (config, ssh, pod lifecycle, downloads).
+# Anything not training-specific lives in runpod_lib so the test-video
+# launcher can use the exact same code path.
+from runpod_lib import (
+    VOLUME_ID, DATA_CENTER, GPU_TYPE, GPU_CANDIDATES, IMAGE, CONTAINER_DISK_GB, MOUNT_PATH,
+    WANDB_ENTITY, WANDB_PROJECT, SSH_KEY, API_KEY, WANDB_KEY,
+    die, get_runpod, list_resources, ssh_run, wait_for_ssh, download_from_pod,
+    tail_lines_from as _tail_lines_from,
+    boot_pod_with_retries, terminate_pod_quiet,
+)
 
-WANDB_ENTITY  = os.environ.get("WANDB_ENTITY", "nazmiryuki")
-WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "openpilot-pipeline")
-
-SSH_KEY = os.path.expanduser(os.environ.get("RUNPOD_SSH_KEY", "~/.ssh/id_ed25519"))
-API_KEY = os.environ.get("RUNPOD_API_KEY")
-WANDB_KEY = os.environ.get("WANDB_API_KEY", "")
+SNPE_SDK_URL  = os.environ.get("SNPE_SDK_URL",
+    "https://softwarecenter.qualcomm.com/api/download/software/sdks/"
+    "Qualcomm_AI_Runtime_Community/All/2.48.0.260626/v2.48.0.260626.zip")
 
 # --------------------------------------------------------------------------------
 # The idempotent provisioning + training script that runs ON THE POD. It reads all
@@ -96,9 +79,10 @@ PIN=b613373
 TORCH_INDEX=https://download.pytorch.org/whl/cu113
 
 : "${DATE_IT:=run1}" "${EPOCHS:=15}" "${BATCH:=8}" "${GEN_GT:=0}" "${AUTO_STOP:=0}"
-: "${LOG_FREQ:=10}" "${VAL_FREQ:=200}"
+: "${LOG_FREQ:=10}" "${VAL_FREQ:=20}" "${CONVERT_ONLY:=0}" "${SPLIT:=0.75}" "${GEN_GT_COUNT:=0}" "${GT_ONLY:=0}"
+: "${MHP_LOSS:=0}"
 : "${WB_ENTITY:=nazmiryuki}" "${WB_PROJECT:=openpilot-pipeline}"
-: "${WANDB_API_KEY:=}" "${RUNPOD_API_KEY:=}"
+: "${WANDB_API_KEY:=}" "${RUNPOD_API_KEY:=}" "${SNPE_SDK_URL:=}"
 
 echo ">>> provision start $(date)"
 
@@ -151,6 +135,126 @@ GT="$REPO/gt_distill/generate_gt.py"
 grep -q 'GT_THREADS' "$GT" || sed -i 's|options.intra_op_num_threads = 30|options.intra_op_num_threads = int(os.environ.get("GT_THREADS","30"))|' "$GT"
 grep -q 'skip calib' "$GT" || sed -i 's|^\( *\)save_segment_calib(dir_path|\1pass # skip calib: save_segment_calib(dir_path|' "$GT"
 
+# 6b) patch train.py: the wandb preview render builds two full-segment RGB videos in
+#     RAM (~1GB each) and OOM-kills training on memory-limited pods -- and because it
+#     runs in the final epoch BEFORE the end-of-training model save, an OOM there means
+#     the trained model never gets saved/converted. So gate the render behind
+#     RENDER_PREVIEW (default off) AND keep it to the final epoch only. Idempotent;
+#     upgrades the older VIZ_AT_END patch. Survives 'git checkout $PIN' (refuses to
+#     clobber local modifications).
+python - "$REPO/train/train.py" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+orig     = "                visualize_predictions(model, device, train_segment_for_viz, val_segment_for_viz)\n"
+old_viz  = ("                visualize_predictions(model, device, train_segment_for_viz, val_segment_for_viz)"
+            " if epoch == epochs - 1 else None  # VIZ_AT_END\n")
+new_line = ("                visualize_predictions(model, device, train_segment_for_viz, val_segment_for_viz)"
+            " if (epoch == epochs - 1 and os.environ.get('RENDER_PREVIEW','0') == '1') else None  # VIZ_AT_END RENDER_PREVIEW\n")
+if 'RENDER_PREVIEW' in s:
+    print(">>> train.py already patched (RENDER_PREVIEW)")
+elif old_viz in s:
+    open(p, 'w', encoding='utf-8').write(s.replace(old_viz, new_line, 1))
+    print(">>> upgraded train.py viz patch: preview gated on RENDER_PREVIEW (final epoch only)")
+elif orig in s:
+    open(p, 'w', encoding='utf-8').write(s.replace(orig, new_line, 1))
+    print(">>> patched train.py: preview gated on RENDER_PREVIEW (final epoch only)")
+else:
+    print(">>> [warn] could not patch train.py viz (call not found); viz unchanged")
+PYEOF
+
+# 6c) make the preview render memory-safe. The stock render loads a full ~1190-frame
+#     segment (a ~1.8GB YUV buffer + two ~1GB RGB video arrays) and OOM-kills training on
+#     small pods -- and since it runs in the final epoch before the model save, that also
+#     loses the trained model. So (1) cap the rendered frames (VIZ_FRAMES, default 450)
+#     and (2) bound the GT loop to the rendered length. The preview still uploads to wandb
+#     exactly as before; we just don't buffer the whole segment. Idempotent (VIZ_CAP marker).
+python - "$REPO/train/train.py" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+if 'VIZ_CAP' in s:
+    print(">>> train.py already patched (VIZ_CAP)"); raise SystemExit
+load_old = "            input_frames, rgb_frames = load_transformed_video(path_to_segment)\n"
+load_new = "            input_frames, rgb_frames = load_transformed_video(path_to_segment, seq_len=int(os.environ.get('VIZ_FRAMES', '450')))  # VIZ_CAP\n"
+gt_old = "            for k in range(plan_gt_h5.shape[0]):\n"
+gt_new = "            for k in range(min(plan_gt_h5.shape[0], rgb_frames.shape[0])):\n"
+n = 0
+for old, new in [(load_old, load_new), (gt_old, gt_new)]:
+    if old in s:
+        s = s.replace(old, new, 1); n += 1
+    else:
+        print(">>> [warn] VIZ_CAP: pattern not found:\n" + old.strip())
+open(p, 'w', encoding='utf-8').write(s)
+print(">>> patched train.py: capped preview to VIZ_FRAMES frames (%d/2 edits)" % n)
+PYEOF
+
+# 6d) OPTION-1 calibration: project the preview with each segment's real liveCalibration
+#     rpy instead of a hardcoded [0,0,0], so the GT/pred paths lie flat on the road instead
+#     of pitching down. Reuses gt_distill.parse_logs (LogReader). Robust: falls back to zero
+#     rpy with a warning if a segment's log can't be parsed. Idempotent (VIZ_CALIB marker).
+python - "$REPO/train/train.py" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+if 'VIZ_CALIB' in s:
+    print(">>> train.py already patched (VIZ_CALIB)"); raise SystemExit
+
+# built from double-quoted line pieces on purpose: a triple-quoted Python string here
+# would terminate the outer PROVISION_SCRIPT literal that this whole script lives in.
+helper = "\n".join([
+    "_VIZ_RPY = [0, 0, 0]  # VIZ_CALIB",
+    "",
+    "",
+    "def _set_viz_rpy(segment_path):",
+    "    # mean liveCalibration rpy so the preview projection matches real camera roll/pitch/yaw",
+    "    global _VIZ_RPY",
+    "    try:",
+    "        import numpy as _np, os as _os, sys as _sys",
+    "        _op = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), '..', 'common'))",
+    "        if _op not in _sys.path:",
+    "            _sys.path.append(_op)",
+    "        from gt_distill.parse_logs import parse_logs",
+    "        rpy_seg, _ext = parse_logs(segment_path, _op)",
+    "        if rpy_seg is None:",
+    "            printf('[viz] no calibration for ' + str(segment_path) + '; using zero rpy')",
+    "            _VIZ_RPY = [0, 0, 0]; return",
+    "        rpy = _np.asarray(rpy_seg).reshape(-1, 3)",
+    "        rpy = rpy[_np.any(rpy != 0, axis=1)]",
+    "        _VIZ_RPY = [0, 0, 0] if rpy.shape[0] == 0 else [float(v) for v in rpy.mean(axis=0)]",
+    "        printf('[viz] segment rpy (roll,pitch,yaw) = ' + str(_VIZ_RPY))",
+    "    except Exception as _e:",
+    "        printf('[viz] calibration parse failed (' + str(_e) + '); using zero rpy')",
+    "        _VIZ_RPY = [0, 0, 0]",
+    "",
+    "",
+    "",
+])
+
+anchor_def = "def visualization(lanelines, roadedges, calib_path, im_rgb):\n"
+hard = "    rpy_calib = [0, 0, 0]\n"
+soft = "    rpy_calib = _VIZ_RPY  # VIZ_CALIB: per-segment liveCalibration\n"
+viz_old = ('            path_to_segment = segments_for_viz[i]\n'
+           '            printf(f"===>Visualizing predictions: {path_to_segment}")\n')
+viz_new = viz_old + '            _set_viz_rpy(path_to_segment)\n'
+
+n = 0
+if anchor_def in s:
+    s = s.replace(anchor_def, helper + anchor_def, 1); n += 1
+else:
+    print(">>> [warn] VIZ_CALIB: visualization() def not found")
+if hard in s:
+    s = s.replace(hard, soft, 1); n += 1
+else:
+    print(">>> [warn] VIZ_CALIB: rpy_calib=[0,0,0] line not found")
+if viz_old in s:
+    s = s.replace(viz_old, viz_new, 1); n += 1
+else:
+    print(">>> [warn] VIZ_CALIB: visualize_predictions anchor not found")
+open(p, 'w', encoding='utf-8').write(s)
+print(">>> patched train.py: preview uses per-segment liveCalibration rpy (%d/3 edits)" % n)
+PYEOF
+
 # 7) dataset (download comma2k19 if not present)
 if [ -z "$(find "$DATA" -name video.hevc 2>/dev/null | head -1)" ]; then
   echo ">>> downloading comma2k19 (~94GB)"
@@ -191,28 +295,189 @@ if [ "$GEN_GT" = "1" ]; then
   echo ">>> GT done: $(find "$DATA" -name gt_distill.h5 | wc -l) files"
 fi
 
+# 9b) generate GT for a LIMITED number of additional segments (grow the training set
+#     without processing all ~2000). Picks only segments that don't already have GT,
+#     so it's safe to re-run and it never redoes existing work.
+if [ "${GEN_GT_COUNT:-0}" -gt 0 ]; then
+  cd "$REPO"
+  HAVE=$(find "$DATA" -name gt_distill.h5 2>/dev/null | wc -l)
+  echo ">>> GT grow: have $HAVE segments, generating up to $GEN_GT_COUNT more"
+  # segments (dirs with video.hevc) that do NOT yet have gt_distill.h5
+  find "$DATA" -name video.hevc -printf '%h\n' 2>/dev/null | sort -u | while read -r d; do
+    [ -f "$d/gt_distill.h5" ] || printf '%s\n' "$d"
+  done > "$WS/gt_todo_all.txt"
+  head -n "$GEN_GT_COUNT" "$WS/gt_todo_all.txt" > "$WS/gt_todo.txt"
+  NTODO=$(wc -l < "$WS/gt_todo.txt")
+  echo ">>> $NTODO new segments to process"
+  if [ "$NTODO" -gt 0 ]; then
+    # Keep parallelism modest: each worker loads the model + decodes ~1200 frames,
+    # so too many at once OOM-kills some (that's what capped a 16-wide run at ~43%).
+    # Tunable via GT_PAR (concurrent workers) and GT_THREADS_EACH.
+    N="${GT_PAR:-4}"; T="${GT_THREADS_EACH:-6}"; SD="$WS/gt_shards"
+    mkdir -p "$SD" "$WS/gt_logs"; rm -f "$SD"/s_*.txt "$WS/gt_logs"/grow_*.log
+    awk -v n=$N -v d="$SD" '{print > (d "/s_" (NR%n) ".txt")}' "$WS/gt_todo.txt"
+    for i in $(seq 0 $((N-1))); do
+      [ -s "$SD/s_$i.txt" ] || continue
+      GT_THREADS=$T OMP_NUM_THREADS=$T python gt_distill/generate_gt.py \
+        --recordings_basedir "$DATA" --cache "$SD/s_$i.txt" \
+        --openpilot_dir "$REPO/common" > "$WS/gt_logs/grow_$i.log" 2>&1 &
+    done
+    wait
+    # surface why any segments failed (OOM kill vs bad/missing data vs code error)
+    echo ">>> grow failure summary (top messages, if any):"
+    grep -hiE 'error|exception|killed|traceback|no such|cannot|memoryerror' \
+      "$WS/gt_logs"/grow_*.log 2>/dev/null | sed 's/[0-9]\{2,\}//g' \
+      | sort | uniq -c | sort -rn | head -10 || true
+  fi
+  echo ">>> GT grow done: $(find "$DATA" -name gt_distill.h5 | wc -l) segments total"
+  # The dataset caches its segment list in $REPO/cache/{segments,videos,plans}.txt and
+  # reuses it without rescanning. We just changed the GT set, so invalidate that cache;
+  # the next training run rebuilds it (once) and later runs reuse it. Clearing only here
+  # (not every train run) avoids a slow full rescan of the 94GB tree on each run.
+  rm -f "$REPO/cache/segments.txt" "$REPO/cache/videos.txt" "$REPO/cache/plans.txt" 2>/dev/null || true
+  echo ">>> invalidated dataset path cache (next training run will rescan)"
+fi
+
 # 10) train. train.py sometimes hangs on exit (dataloader/wandb threads don't
 #     close), which would block auto-stop / the launcher forever. So run it in
 #     the background and force-exit once it logs "training_finished" (the model
-#     is already saved by that point).
-echo ">>> starting training ($DATE_IT) $(date)"
-cd "$REPO/train"
-TLOG="$WS/train_${DATE_IT}.log"
-PYTHONPATH="$REPO" WANDB_ENTITY="$WB_ENTITY" WANDB_PROJECT="$WB_PROJECT" \
-  python train.py --date_it "$DATE_IT" --recordings_basedir "$DATA" \
-  --batch_size "$BATCH" --epochs "$EPOCHS" \
-  --log_frequency "$LOG_FREQ" --val_frequency "$VAL_FREQ" > "$TLOG" 2>&1 &
-TRAIN_PID=$!
-while kill -0 "$TRAIN_PID" 2>/dev/null; do
-  if grep -q "training_finished" "$TLOG" 2>/dev/null; then
-    sleep 10; kill "$TRAIN_PID" 2>/dev/null; pkill -P "$TRAIN_PID" 2>/dev/null; break
-  fi
-  sleep 15
-done
-wait "$TRAIN_PID" 2>/dev/null
-echo ">>> TRAINING FINISHED $(date)"
+#     is already saved by that point). Skipped entirely in CONVERT_ONLY mode
+#     (which just re-converts an already-trained .pth on the volume).
+if [ "$GT_ONLY" = "1" ]; then
+  echo ">>> GT_ONLY=1: grew the dataset, skipping training + conversion"
+elif [ "$CONVERT_ONLY" = "1" ]; then
+  echo ">>> CONVERT_ONLY=1: skipping training, will convert existing .pth"
+else
+  # NOTE: the dataset path cache is invalidated in the GT-grow step (9b) when the GT set
+  # changes, so it's correct here without a slow rescan every run.
+  echo ">>> starting training ($DATE_IT) $(date)"
+  cd "$REPO/train"
+  TLOG="$WS/train_${DATE_IT}.log"
+  # loss selection: default is KL-divergence distillation; --mhp-loss switches to
+  # the sigma-clamped Laplacian likelihood loss (train.py's --mhp_loss).
+  MHP_FLAG=""
+  if [ "$MHP_LOSS" = "1" ]; then MHP_FLAG="--mhp_loss"; echo ">>> using Laplacian MHP likelihood loss"; fi
+  # WANDB_START_METHOD=thread: run wandb in a thread instead of a helper subprocess.
+  # The subprocess default intermittently fails with "Error communicating with wandb
+  # process" on resource-constrained pods, which crashes train.py before any epoch.
+  PYTHONPATH="$REPO" WANDB_ENTITY="$WB_ENTITY" WANDB_PROJECT="$WB_PROJECT" \
+    WANDB_START_METHOD=thread \
+    python train.py --date_it "$DATE_IT" --recordings_basedir "$DATA" \
+    --batch_size "$BATCH" --epochs "$EPOCHS" --split "$SPLIT" \
+    --log_frequency "$LOG_FREQ" --val_frequency "$VAL_FREQ" $MHP_FLAG > "$TLOG" 2>&1 &
+  TRAIN_PID=$!
+  while kill -0 "$TRAIN_PID" 2>/dev/null; do
+    if grep -q "training_finished" "$TLOG" 2>/dev/null; then
+      sleep 10; kill "$TRAIN_PID" 2>/dev/null; pkill -P "$TRAIN_PID" 2>/dev/null; break
+    fi
+    sleep 15
+  done
+  wait "$TRAIN_PID" 2>/dev/null
+  echo ">>> TRAINING FINISHED $(date)"
+fi
 
-# 11) optional: stop the pod to end GPU billing
+# 11) convert .pth -> .onnx -> .dlc  (skipped in GT_ONLY mode -- nothing was trained)
+TRAIN_DIR="$REPO/train"
+MODEL_PTH="$TRAIN_DIR/nets/model_itr/${DATE_IT}.pth"
+MODEL_ONNX="$TRAIN_DIR/nets/model_itr/${DATE_IT}.onnx"
+MODEL_DLC="$TRAIN_DIR/nets/model_itr/${DATE_IT}.dlc"
+
+if [ "$GT_ONLY" = "1" ]; then
+  echo ">>> GT_ONLY=1: skipping .pth -> .onnx -> .dlc conversion"
+elif [ -f "$MODEL_PTH" ]; then
+  echo ">>> converting .pth -> .onnx"
+  conda activate "$ENVN"
+  cd "$TRAIN_DIR"
+  PYTHONPATH="$REPO" python torch_to_onnx.py "$MODEL_PTH" "$MODEL_ONNX" \
+    && echo ">>> ONNX conversion done: $MODEL_ONNX" \
+    || echo ">>> [warn] ONNX conversion failed"
+else
+  echo ">>> [warn] .pth not found, skipping conversion: $MODEL_PTH"
+fi
+
+if [ "$GT_ONLY" != "1" ] && [ -f "$MODEL_ONNX" ] && [ -n "$SNPE_SDK_URL" ]; then
+  echo ">>> setting up QAIRT/SNPE SDK for .onnx -> .dlc"
+  SNPE_DIR="$WS/snpe_sdk"
+  if [ ! -d "$SNPE_DIR/qairt" ]; then
+    mkdir -p "$SNPE_DIR"
+    echo ">>> downloading QAIRT SDK (~2.3GB, one-time; this can take several minutes)..."
+    curl -fsSL -o /tmp/snpe_sdk.zip "$SNPE_SDK_URL"
+    echo ">>> unpacking QAIRT SDK..."
+    unzip -q /tmp/snpe_sdk.zip -d "$SNPE_DIR"; rm -f /tmp/snpe_sdk.zip
+    echo ">>> QAIRT SDK ready"
+  fi
+  # the zip root is qairt/<version>/...; find the version dir (= QAIRT_SDK_ROOT)
+  QAIRT_SDK_ROOT=$(find "$SNPE_DIR/qairt" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+  SNPE_BIN="${QAIRT_SDK_ROOT:-}/bin/x86_64-linux-clang/snpe-onnx-to-dlc"
+
+  if [ -n "$QAIRT_SDK_ROOT" ] && [ -f "$SNPE_BIN" ]; then
+    # snpe-onnx-to-dlc is a python script (qti.aisw.converters) that needs Python 3.10
+    # on Ubuntu 22.04 with pinned deps, kept in its OWN venv (must not pollute the
+    # conda training env, whose numpy/onnx/etc. versions differ).
+    SNPE_VENV="$WS/snpe_venv"
+    # The converter's compiled extension (libPyIrGraph310.so) dlopen()s
+    # libpython3.10.so.1.0. apt packages live in the EPHEMERAL container root (NOT
+    # the network volume), so python3.10 + libpython3.10 must be (re)installed on
+    # EVERY pod boot -- even when the venv already exists on the volume.
+    # libc++1/libc++abi1: the converter's extension is built with clang/libc++
+    # (the base image only ships libstdc++, so libc++.so.1 is otherwise missing).
+    echo ">>> ensuring python3.10 + libpython3.10 + libc++ present (needed by the converter)"
+    apt-get install -y -qq python3.10 python3.10-venv python3-distutils libpython3.10 \
+      libc++1 libc++abi1 >/dev/null 2>&1 || true
+    # Fallback: locate libpython3.10.so.1.0 so we can add its dir to LD_LIBRARY_PATH
+    # in case apt put it somewhere off the default loader path.
+    LIBPY=$(find /usr/lib /usr/local/lib /opt -name 'libpython3.10.so*' 2>/dev/null | head -1)
+    LIBPY_DIR=""; [ -n "$LIBPY" ] && LIBPY_DIR=$(dirname "$LIBPY")
+    if [ ! -x "$SNPE_VENV/bin/python" ]; then
+      echo ">>> creating dedicated python3.10 venv for the SNPE converter"
+      python3.10 -m venv "$SNPE_VENV" --without-pip 2>/dev/null \
+        || echo ">>> [warn] failed to create SNPE venv (python3.10 missing?)"
+      "$SNPE_VENV/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+    fi
+    if [ -x "$SNPE_VENV/bin/python" ]; then
+      # shellcheck disable=SC1091
+      source "$SNPE_VENV/bin/activate"
+      if ! PYTHONPATH="$QAIRT_SDK_ROOT/lib/python:${PYTHONPATH:-}" python -c "import onnx, qti.aisw" 2>/dev/null; then
+        echo ">>> installing SNPE converter python deps (one-time)"
+        python -m pip install -q --upgrade pip
+        python -m pip install -q "onnx==1.19.1"
+        PYTHONPATH="$QAIRT_SDK_ROOT/lib/python:${PYTHONPATH:-}" \
+          python "$QAIRT_SDK_ROOT/bin/check-python-dependency" \
+          || echo ">>> [warn] some SNPE python deps failed to install"
+      fi
+      # Pin numpy to the version Qualcomm's compiled extension expects (numpy 2.x
+      # breaks its C ABI). Enforced every run since the guard above may skip reinstall.
+      python -c "import numpy; assert numpy.__version__ == '1.26.4'" 2>/dev/null \
+        || python -m pip install -q "numpy==1.26.4"
+      echo ">>> running snpe-onnx-to-dlc..."
+      # The ONNX is exported with a dynamic batch axis, so SNPE needs each input's
+      # concrete shape via -d. Batch is fixed to 1 (openpilot runs supercombo at
+      # batch 1 on-device). Shapes come from train/torch_to_onnx.py's example inputs.
+      PYTHONPATH="$QAIRT_SDK_ROOT/lib/python:${PYTHONPATH:-}" \
+        LD_LIBRARY_PATH="$QAIRT_SDK_ROOT/lib/x86_64-linux-clang:${LIBPY_DIR:+$LIBPY_DIR:}${LD_LIBRARY_PATH:-}" \
+        python "$SNPE_BIN" --input_network "$MODEL_ONNX" --output_path "$MODEL_DLC" \
+        -d input_imgs 1,12,128,256 \
+        -d desire 1,8 \
+        -d traffic_convention 1,2 \
+        -d initial_state 1,512 \
+        && echo ">>> DLC conversion done: $MODEL_DLC" \
+        || echo ">>> [warn] DLC conversion failed"
+      deactivate 2>/dev/null || true
+    fi
+  else
+    echo ">>> [warn] snpe-onnx-to-dlc not found under $SNPE_DIR (bad SDK zip layout?)"
+  fi
+elif [ -f "$MODEL_ONNX" ]; then
+  echo ">>> [info] SNPE_SDK_URL not set, skipping .dlc conversion"
+fi
+
+# Final marker: printed ONLY after train + conversion are fully done. The --wait
+# launcher polls for this exact string, so it never downloads/terminates until
+# the .onnx/.dlc actually exist. (Do NOT key completion off 'training_finished';
+# that is logged before conversion runs.)
+echo ">>> PIPELINE FINISHED $(date)"
+
+# 12) optional: stop the pod to end GPU billing
 if [ "$AUTO_STOP" = "1" ] && [ -n "${RUNPOD_POD_ID:-}" ]; then
   echo ">>> auto-stopping pod $RUNPOD_POD_ID"
   curl -s -X POST "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID/stop" \
@@ -222,89 +487,15 @@ fi
 
 
 # --------------------------------------------------------------------------------
-def die(msg):
-    print("ERROR:", msg, file=sys.stderr)
-    sys.exit(1)
-
-
-def get_runpod():
-    try:
-        import runpod
-    except ImportError:
-        die("pip install runpod   (and: pip install requests)")
-    if not API_KEY:
-        die("set RUNPOD_API_KEY env var (RunPod Console -> Settings -> API Keys)")
-    runpod.api_key = API_KEY
-    return runpod
-
-
-def list_resources():
-    runpod = get_runpod()
-    print("\n=== GPU types ===")
-    try:
-        for g in runpod.get_gpus():
-            print(f"  {g.get('id')}")
-    except Exception as e:
-        print("  (could not list GPUs:", e, ")")
-    print("\n=== Your network volumes (use the id as --volume) ===")
-    try:
-        import requests
-        r = requests.get("https://rest.runpod.io/v1/networkvolumes",
-                         headers={"Authorization": f"Bearer {API_KEY}"}, timeout=30)
-        r.raise_for_status()
-        for v in r.json() or []:
-            print(f"  id={v.get('id')}  name={v.get('name')!r}  "
-                  f"dc={v.get('dataCenterId')}  size={v.get('size')}GB")
-    except Exception as e:
-        print("  (REST list failed:", e, ") -> RunPod Console -> Storage -> volume -> ID")
-    print()
-
-
-def ssh_run(host, port, command, stdin=None, quiet=False, check=True):
-    cmd = ["ssh",
-           "-o", "StrictHostKeyChecking=no",       # ephemeral pods; skip host-key prompts
-           "-o", "UserKnownHostsFile=/dev/null",    # don't try to write ~/.ssh/known_hosts
-           "-o", "LogLevel=ERROR", "-o", "BatchMode=yes", "-o", "ConnectTimeout=25",
-           "-i", SSH_KEY, "-p", str(port), f"root@{host}", command]
-    # Always send stdin as LF-normalized bytes so scripts run under Linux bash
-    # regardless of this file's (Windows) line endings.
-    inp = None
-    if stdin is not None:
-        inp = stdin.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
-    res = subprocess.run(cmd, input=inp, capture_output=True)
-    out = res.stdout.decode("utf-8", "replace")
-    err = res.stderr.decode("utf-8", "replace")
-    if not quiet:
-        if out.strip():
-            print(out.strip())
-        if err.strip() and "Permanently added" not in err:
-            print(err.strip(), file=sys.stderr)
-    if check and res.returncode != 0:
-        return None
-    return res
-
-
-def wait_for_ssh(runpod, pod_id, timeout=600):
-    print("Waiting for the pod to boot and expose SSH...")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            pod = runpod.get_pod(pod_id)
-        except Exception:
-            pod = None
-        for p in ((pod or {}).get("runtime") or {}).get("ports") or []:
-            if p.get("privatePort") == 22 and p.get("isIpPublic") and p.get("publicPort"):
-                host, port = p["ip"], p["publicPort"]
-                if ssh_run(host, port, "echo ok", quiet=True):
-                    print(f"SSH is up: root@{host} -p {port}")
-                    return host, port
-        time.sleep(10)
-    die("timed out waiting for SSH. Check the pod in the RunPod console.")
+# NOTE: die / get_runpod / list_resources / ssh_run / wait_for_ssh /
+# download_from_pod / _tail_lines_from are imported from runpod_lib above.
+# Only training-specific glue lives below.
+# --------------------------------------------------------------------------------
 
 
 def start_remote(host, port, args):
     # remove stale logs from a prior run with the same date_it BEFORE launching,
-    # so the --wait poll can't see an old 'training_finished'/'TRAINING FINISHED'.
+    # so the --wait poll can't see an old 'PIPELINE FINISHED' from a previous run.
     ssh_run(host, port,
             f"rm -f /workspace/train_{args.date_it}.log /workspace/launch_{args.date_it}.log",
             quiet=True, check=False)
@@ -314,61 +505,81 @@ def start_remote(host, port, args):
                stdin=PROVISION_SCRIPT) is None:
         die("failed to upload provisioning script over SSH")
     # ...and run it fully detached with all parameters passed via env.
+    snpe_url = getattr(args, "snpe_sdk_url", None) or SNPE_SDK_URL
     envs = {
         "DATE_IT": args.date_it, "EPOCHS": str(args.epochs), "BATCH": str(args.batch_size),
         "GEN_GT": "1" if args.gen_gt else "0",
+        "CONVERT_ONLY": "1" if args.convert_only else "0",
         # in --wait mode the launcher downloads the model then terminates the pod,
         # so the pod must NOT stop itself first.
         "AUTO_STOP": "1" if (args.auto_stop and not args.wait) else "0",
         "LOG_FREQ": str(args.log_frequency), "VAL_FREQ": str(args.val_frequency),
+        "SPLIT": str(args.split), "GEN_GT_COUNT": str(args.gen_gt_count),
+        "MHP_LOSS": "1" if args.mhp_loss else "0",
+        "RENDER_PREVIEW": "1" if args.preview else "0",
+        "GT_ONLY": "1" if args.gt_only else "0",
         "WB_ENTITY": WANDB_ENTITY, "WB_PROJECT": WANDB_PROJECT,
         "WANDB_API_KEY": WANDB_KEY, "RUNPOD_API_KEY": API_KEY,
+        "SNPE_SDK_URL": snpe_url,
     }
     env_prefix = " ".join(f'{k}="{v}"' for k, v in envs.items())
     launch = (f"setsid nohup env {env_prefix} bash /workspace/_provision.sh "
               f"> /workspace/launch_{args.date_it}.log 2>&1 < /dev/null & echo LAUNCHED pid=$!")
-    print("Launching provision+train on the pod...")
+    print("Launching convert-only on the pod..." if args.convert_only
+          else "Launching provision+train on the pod...")
     ssh_run(host, port, f"bash -lc '{launch}'")
 
 
-def download_from_pod(host, port, remote, local):
-    """Stream a remote file over ssh into a local file. Avoids scp's Windows/
-    cygwin path quirks (e.g. it misreading 'C:\\...' as a remote host)."""
-    cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-           "-o", "LogLevel=ERROR", "-o", "BatchMode=yes", "-o", "ConnectTimeout=25",
-           "-i", SSH_KEY, "-p", str(port), f"root@{host}", f"cat '{remote}'"]
-    try:
-        with open(local, "wb") as f:
-            res = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
-        return res.returncode == 0 and os.path.exists(local) and os.path.getsize(local) > 0
-    except Exception:
-        return False
-
-
 def wait_download_terminate(host, port, pod_id, runpod, args):
-    """Block until training finishes, download the model to ./trained_models/,
-    then terminate the pod. The model dir is on the volume, so even if download
-    fails the model is not lost (a later pod can still fetch it)."""
+    """Stream progress until training+conversion finishes, download model artifacts
+    to ./trained_models/, then terminate the pod. Files remain on the volume so a
+    failed download can be retried later with another pod."""
     log = f"/workspace/launch_{args.date_it}.log"
     tlog = f"/workspace/train_{args.date_it}.log"
     train_dir = "/workspace/openpilot-pipeline/train/nets"
     remote_model = f"{train_dir}/model_itr/{args.date_it}.pth"
 
-    print("\n--wait: staying up until training finishes (polling every 60s).")
-    print("Keep this window open. Ctrl+C stops watching but NOT the pod.")
+    print("\n--wait: streaming progress until training+conversion finishes.")
+    print("Keep this window open. Ctrl+C stops watching but NOT the pod.\n")
+    next_launch_line = 1
+    last_train_progress = ""
+
+    def pump_launch_log():
+        nonlocal next_launch_line
+        new_lines, next_launch_line = _tail_lines_from(host, port, log, next_launch_line)
+        for ln in new_lines:
+            s = ln.rstrip("\r")
+            if s.strip():
+                print("  " + s)
+
     while True:
+        # 1) stream provisioning + conversion markers ('>>> ...') and setup output.
+        pump_launch_log()
+
+        # 2) surface the latest training epoch/step progress line (filtering tqdm noise).
         r = ssh_run(host, port,
-                    f"if grep -q 'TRAINING FINISHED' {log} 2>/dev/null || "
-                    f"grep -q 'training_finished' {tlog} 2>/dev/null || "
+                    f"grep -aE 'Epoch [0-9]+/|Epoch [0-9]+ done|Validation Loss|Visualizing predictions' "
+                    f"{tlog} 2>/dev/null | tail -1", quiet=True, check=False)
+        tp = (r.stdout.decode("utf-8", "replace").strip() if r else "")
+        if tp and tp != last_train_progress:
+            last_train_progress = tp
+            print("  [train] " + tp)
+
+        # 3) done? 'PIPELINE FINISHED' is logged only after train AND conversion
+        #    complete, so we never grab the .pth / terminate before .onnx/.dlc exist.
+        #    The pgrep fallback catches a crashed/exited provision script.
+        r = ssh_run(host, port,
+                    f"if grep -q 'PIPELINE FINISHED' {log} 2>/dev/null || "
                     f"! pgrep -f '[_]provision.sh' >/dev/null 2>&1; then echo DONE; else echo RUNNING; fi",
                     quiet=True, check=False)
         state = r.stdout.decode("utf-8", "replace") if r else ""
         if "DONE" in state:
+            pump_launch_log()  # flush any final lines (e.g. the PIPELINE FINISHED marker)
             break
-        time.sleep(60)
-    print("Training finished (or the run ended).")
+        time.sleep(20)
+    print("\nTraining + conversion finished (or the run ended).")
 
-    # Locate the model: prefer the final model, else the newest checkpoint.
+    # Locate the .pth: prefer the final model, else the newest checkpoint.
     find = ssh_run(host, port,
                    f"if [ -f {remote_model} ]; then echo FINAL {remote_model}; "
                    f"else ls -t {train_dir}/checkpoints/*.pth 2>/dev/null | head -1 | sed 's/^/CKPT /'; fi",
@@ -377,19 +588,38 @@ def wait_download_terminate(host, port, pod_id, runpod, args):
     local_dir = os.path.join(os.getcwd(), "trained_models")
     os.makedirs(local_dir, exist_ok=True)
 
+    pth_remote = None
     if line.startswith("FINAL ") or line.startswith("CKPT "):
-        kind, remote_path = line.split(" ", 1)
-        local_path = os.path.join(local_dir, f"{args.date_it}.pth" if kind == "FINAL"
-                                   else os.path.basename(remote_path.strip()))
-        print(f"Downloading {kind} model:\n  {remote_path.strip()}\n  -> {local_path}")
-        if download_from_pod(host, port, remote_path.strip(), local_path):
-            print(f"  saved: {local_path} ({os.path.getsize(local_path)//(1024*1024)} MB)")
+        kind, pth_remote = line.split(" ", 1)
+        pth_remote = pth_remote.strip()
+        local_pth = os.path.join(local_dir, f"{args.date_it}.pth" if kind == "FINAL"
+                                  else os.path.basename(pth_remote))
+        print(f"Downloading {kind} model:\n  {pth_remote}\n  -> {local_pth}")
+        if download_from_pod(host, port, pth_remote, local_pth):
+            print(f"  saved: {local_pth} ({os.path.getsize(local_pth)//(1024*1024)} MB)")
         else:
-            print("  [!] download failed. The model is still on the volume at:")
-            print(f"      {remote_path.strip()}  (fetch it later with another pod)")
+            print("  [!] download failed. Model is still on the volume at:")
+            print(f"      {pth_remote}  (fetch it later with another pod)")
     else:
         print("[!] No model file found — training may have crashed. "
               "Check the wandb run / pod logs. Nothing to download.")
+
+    # Download .onnx if present (produced by the post-training conversion step).
+    stem = os.path.splitext(os.path.basename(pth_remote))[0] if pth_remote else args.date_it
+    model_dir_remote = f"{train_dir}/model_itr"
+    for ext in ("onnx", "dlc"):
+        remote_path = f"{model_dir_remote}/{stem}.{ext}"
+        chk = ssh_run(host, port, f"test -f '{remote_path}' && echo EXISTS || echo MISSING",
+                      quiet=True, check=False)
+        if chk and "EXISTS" in chk.stdout.decode("utf-8", "replace"):
+            local_path = os.path.join(local_dir, f"{stem}.{ext}")
+            print(f"Downloading .{ext}:\n  {remote_path}\n  -> {local_path}")
+            if download_from_pod(host, port, remote_path, local_path):
+                print(f"  saved: {local_path} ({os.path.getsize(local_path)//(1024*1024)} MB)")
+            else:
+                print(f"  [!] .{ext} download failed. Still on volume at: {remote_path}")
+        else:
+            print(f"  [info] .{ext} not found on pod (conversion may have been skipped).")
 
     print(f"Terminating pod {pod_id} ...")
     try:
@@ -405,18 +635,59 @@ def main():
     ap.add_argument("--volume", default=VOLUME_ID, help="network volume ID (or set RUNPOD_VOLUME_ID)")
     ap.add_argument("--gpu", default=GPU_TYPE, help="preferred GPU type id (tried first, then fallbacks)")
     ap.add_argument("--strict-gpu", action="store_true", help="only use --gpu, no automatic fallback")
+    ap.add_argument("--boot-timeout", type=int, default=120,
+                    help="seconds to wait for a new pod to expose SSH before giving up on that "
+                         "host and creating a fresh one (default 120)")
+    ap.add_argument("--boot-retries", type=int, default=5,
+                    help="how many pods to try if hosts get stuck 'Initializing' before failing "
+                         "(default 5)")
     ap.add_argument("--dc", default=DATA_CENTER, help="data center id (must match the volume)")
     ap.add_argument("--date-it", default="run1", help="wandb run name")
     ap.add_argument("--epochs", type=int, default=15)
-    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--batch-size", type=int, default=8,
+                    help="batch size (== dataloader workers). Bigger batch => more GPU RAM used "
+                         "(activations scale with it). CRITICAL: BOTH the train AND validation "
+                         "split must have >= batch_size GT segments, or the batched loader hangs "
+                         "trying to fill a batch. Default 8 is safe with the current ~50 GT "
+                         "segments (split 0.75 -> train=38, val=12). Rule of thumb: "
+                         "batch_size <= round(N_gt * (1-split)).")
+    ap.add_argument("--split", type=float, default=0.75,
+                    help="train/val split fraction. With N GT segments, train gets round(N*split) "
+                         "and val gets the rest -- each side must be >= batch_size. Default 0.75.")
+    ap.add_argument("--mhp-loss", action="store_true",
+                    help="train with the Laplacian MHP likelihood loss (numerically stable, "
+                         "sigma-clamped) instead of the default KL-divergence distillation loss. "
+                         "Passes --mhp_loss through to train.py.")
+    ap.add_argument("--preview", action="store_true",
+                    help="render the GT/prediction preview at the end of training and upload it to "
+                         "wandb (not downloaded locally). Memory-safe -- capped to VIZ_FRAMES frames "
+                         "(env, default 450) so it won't OOM the pod. Raise VIZ_FRAMES for a longer "
+                         "preview if the pod has spare RAM.")
     ap.add_argument("--log-frequency", type=int, default=10, help="log train loss to wandb every N steps")
-    ap.add_argument("--val-frequency", type=int, default=200, help="run validation every N steps")
+    ap.add_argument("--val-frequency", type=int, default=20,
+                    help="run validation + log GT/prediction preview videos to wandb every N "
+                         "steps. MUST be <= steps-per-epoch or it never triggers (tr_it resets "
+                         "each epoch); this small dataset has ~27 steps/epoch, so keep it low.")
     ap.add_argument("--gen-gt", action="store_true", help="generate FULL ground truth before training")
+    ap.add_argument("--gen-gt-count", type=int, default=0, metavar="N",
+                    help="before training, generate ground truth for N MORE segments that don't "
+                         "have it yet (grows the training set; skips already-done segments). "
+                         "You have ~21 now, so --gen-gt-count 21 roughly doubles it to ~42.")
+    ap.add_argument("--gt-only", action="store_true",
+                    help="only grow ground truth (with --gen-gt-count/--gen-gt), then stop -- no "
+                         "training or conversion. GT is saved on the volume for future runs.")
+    ap.add_argument("--convert-only", action="store_true",
+                    help="skip training; just convert the existing <date-it>.pth on the "
+                         "volume to .onnx/.dlc and (with --wait) download them")
     ap.add_argument("--no-train", action="store_true", help="just provision; don't start training")
     ap.add_argument("--auto-stop", action="store_true", help="stop the pod when training finishes")
     ap.add_argument("--wait", action="store_true",
                     help="keep running until training finishes, download the model to "
                          "./trained_models/, then TERMINATE the pod")
+    ap.add_argument("--snpe-sdk-url", default="",
+                    help="direct download URL for the Qualcomm SNPE SDK zip "
+                         "(enables .onnx -> .dlc conversion on the pod). "
+                         "Can also be set via SNPE_SDK_URL env var.")
     args = ap.parse_args()
 
     runpod = get_runpod()
@@ -432,39 +703,10 @@ def main():
     if args.strict_gpu:
         try_gpus = [args.gpu]
 
-    def is_unavailable(err):
-        m = str(err).lower()
-        return any(s in m for s in (
-            "no longer any instances", "no instances", "not available",
-            "instances available", "unavailable", "capacity", "out of stock"))
-
-    pod = None
-    for gpu in try_gpus:
-        print(f"Trying GPU {gpu!r} in {args.dc} ...")
-        try:
-            pod = runpod.create_pod(
-                name=f"optrain-{args.date_it}", image_name=IMAGE, gpu_type_id=gpu,
-                cloud_type="SECURE", data_center_id=args.dc, network_volume_id=args.volume,
-                volume_mount_path=MOUNT_PATH, container_disk_in_gb=CONTAINER_DISK_GB,
-                ports="22/tcp", start_ssh=True,
-            )
-            print(f"  -> got it: {gpu}")
-            break
-        except Exception as e:
-            if is_unavailable(e):
-                print(f"  -> unavailable, trying next")
-                continue
-            die(f"create_pod failed (not an availability issue): {e}\n"
-                f"Check --dc matches the volume's region and the API key is valid.")
-    if pod is None:
-        die(f"No GPU from the candidate list is available in {args.dc} right now.\n"
-            f"Try again shortly, or pass a different --gpu (see --list). "
-            f"Use --strict-gpu to only try the one you request.")
-
-    pod_id = pod["id"]
-    print(f"Pod created: {pod_id}  (console: https://www.runpod.io/console/pods)")
-
-    host, port = wait_for_ssh(runpod, pod_id)
+    # Shared boot loop from runpod_lib (create + wait-for-SSH + retry on stuck hosts).
+    pod_id, host, port = boot_pod_with_retries(
+        runpod, name=f"optrain-{args.date_it}", dc=args.dc, volume_id=args.volume,
+        gpu_candidates=try_gpus, boot_timeout=args.boot_timeout, boot_retries=args.boot_retries)
 
     if args.no_train:
         print("Provisioning without training...")

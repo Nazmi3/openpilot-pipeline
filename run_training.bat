@@ -21,7 +21,7 @@ if "%RUNPOD_API_KEY%"=="" (
   exit /b 1
 )
 
-python launch_runpod_training.py --date-it run1 --epochs 15 --wait %*
+python launch_runpod_training.py --date-it run1 --epochs 15 --mhp-loss --preview --wait %*
 
 echo.
 echo ============================================================
