@@ -86,6 +86,7 @@ mkdir -p "$STAGE"
 
 : "${DATE_IT:=run1}" "${DURATION:=60}" "${FPS:=20}"
 : "${SEGMENT:=}" "${OUTPUT:=}"
+: "${NUM_SEGMENTS:=1}" "${SEED:=42}"
 
 echo ">>> test-video start $(date)"
 
@@ -111,37 +112,67 @@ if [ ! -f "$MODEL_PTH" ]; then
   fi
 fi
 
-# Pick a segment if the caller didn't force one. First choice: a segment that
-# also has GT (matches training). Otherwise: any segment with a video.
-if [ -z "$SEGMENT" ]; then
-  SEGMENT=$(find "$DATA" -name gt_distill.h5 -printf '%h\n' 2>/dev/null | head -1)
+# --- choose segments ---------------------------------------------------------
+# Prefer segments that have GT (same population the model trained on). When
+# NUM_SEGMENTS > 1 we pick at random, seeded so a run is reproducible.
+# An explicit $SEGMENT always wins and forces a single segment.
+SEG_LIST="$WS/pred_segments.txt"
+: > "$SEG_LIST"
+if [ -n "$SEGMENT" ]; then
+  echo "$SEGMENT" > "$SEG_LIST"
+else
+  find "$DATA" -name gt_distill.h5 -printf '%h\n' 2>/dev/null | sort > "$WS/pred_pool.txt"
+  if [ ! -s "$WS/pred_pool.txt" ]; then
+    find "$DATA" -name video.hevc -printf '%h\n' 2>/dev/null | sort > "$WS/pred_pool.txt"
+  fi
+  POOL=$(wc -l < "$WS/pred_pool.txt")
+  if [ "$POOL" -eq 0 ]; then
+    echo ">>> ERROR: could not find any driving segment under $DATA"; exit 4
+  fi
+  echo ">>> segment pool: $POOL with ground truth; picking $NUM_SEGMENTS (seed=$SEED)"
+  # deterministic shuffle: --random-source makes shuf reproducible for a seed
+  shuf --random-source=<(yes "$SEED") -n "$NUM_SEGMENTS" "$WS/pred_pool.txt" > "$SEG_LIST"
 fi
-if [ -z "$SEGMENT" ]; then
-  SEGMENT=$(find "$DATA" -name video.hevc -printf '%h\n' 2>/dev/null | head -1)
-fi
-if [ -z "$SEGMENT" ] || [ ! -d "$SEGMENT" ]; then
-  echo ">>> ERROR: could not find a driving segment under $DATA"
-  exit 4
-fi
-echo ">>> segment:  $SEGMENT"
 echo ">>> model:    $MODEL_PTH"
 
 # --- stage inputs onto local disk (avoids repeated moosefs reads during
 # inference). Copies are large but one-shot; local reads afterward are fast. ---
-VIDEO_SRC=""
-for name in video.hevc fcamera.hevc; do
-  if [ -f "$SEGMENT/$name" ]; then VIDEO_SRC="$SEGMENT/$name"; break; fi
-done
-if [ -z "$VIDEO_SRC" ]; then
-  echo ">>> ERROR: no video.hevc/fcamera.hevc under $SEGMENT"
-  exit 4
+# Each segment gets its own staged dir containing the video AND global_pose/
+# (only ~130KB) so per-segment calibration resolves locally, with no further
+# moosefs access once inference starts.
+SEG_ARGS=""
+i=0
+while IFS= read -r SEG; do
+  [ -n "$SEG" ] || continue
+  if [ ! -d "$SEG" ]; then echo ">>> [warn] not a directory, skipping: $SEG"; continue; fi
+  VIDEO_SRC=""
+  for name in video.hevc fcamera.hevc; do
+    if [ -f "$SEG/$name" ]; then VIDEO_SRC="$SEG/$name"; break; fi
+  done
+  if [ -z "$VIDEO_SRC" ]; then
+    echo ">>> [warn] no video in $SEG, skipping"; continue
+  fi
+  D="$STAGE/seg$i"
+  mkdir -p "$D"
+  echo ">>> staging seg$i ($(du -h "$VIDEO_SRC" | cut -f1)): $SEG"
+  timeout 300 cp "$VIDEO_SRC" "$D/$(basename "$VIDEO_SRC")" || {
+    echo ">>> [warn] staging timed out for $SEG, skipping"; continue;
+  }
+  # calibration source (tiny) -- lets the renderer compute this segment's own rpy
+  if [ -d "$SEG/global_pose" ]; then
+    cp -r "$SEG/global_pose" "$D/" 2>/dev/null || echo ">>> [warn] global_pose copy failed for $SEG"
+  else
+    echo ">>> [warn] no global_pose in $SEG -- calibration will fall back to zero"
+  fi
+  SEG_ARGS="$SEG_ARGS $D"
+  i=$((i+1))
+done < "$SEG_LIST"
+
+if [ "$i" -eq 0 ]; then
+  echo ">>> ERROR: no segments could be staged"; exit 4
 fi
-LOCAL_SEG="$STAGE/segment"
-mkdir -p "$LOCAL_SEG"
-echo ">>> staging video ($(du -h "$VIDEO_SRC" | cut -f1)) to $LOCAL_SEG (moosefs->SSD)..."
-time timeout 300 cp "$VIDEO_SRC" "$LOCAL_SEG/$(basename "$VIDEO_SRC")" || {
-  echo ">>> ERROR: staging video timed out (moosefs is unresponsive)"; exit 5;
-}
+echo ">>> staged $i segment(s)"
+
 LOCAL_MODEL="$STAGE/$(basename "$MODEL_PTH")"
 echo ">>> staging model ($(du -h "$MODEL_PTH" | cut -f1))..."
 time timeout 300 cp "$MODEL_PTH" "$LOCAL_MODEL" || {
@@ -202,13 +233,15 @@ fi
 #   * CUDA_VISIBLE_DEVICES=""  -> force CPU inference (see note in launcher).
 #   * OMP/MKL threads: unbounded numpy would spawn ~all-cores, some hosts
 #     over-subscribe and stall; cap to a sensible number for ~130 GFLOPs/frame.
+# Note: no --segment-logs needed -- each staged segment carries its own
+# global_pose/, so calibration is resolved per segment from local disk.
 cd "$REPO/train"
 CUDA_VISIBLE_DEVICES="" \
   OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}" \
   PYTHONPATH="$REPO" python -u test_prediction_video.py \
-  --model "$LOCAL_MODEL" --segment "$LOCAL_SEG" --output "$OUTPUT" \
+  --model "$LOCAL_MODEL" --segments $SEG_ARGS --output "$OUTPUT" \
   --duration "$DURATION" --fps "$FPS" $TEACHER_ARG $MONTAGE_ARG $CALIB_ARG \
-  --segment-logs "$SEGMENT" --openpilot-dir "$REPO/common"
+  --openpilot-dir "$REPO/common"
 RC=$?
 
 if [ $RC -ne 0 ] || [ ! -f "$OUTPUT" ]; then
@@ -280,6 +313,10 @@ def start_remote(host, port, args):
         # Manual calibration override: launcher takes DEGREES for ergonomics,
         # the test script wants RADIANS, so convert here.
         "RPY_CALIB_RAD": _rpy_deg_to_rad_str(args.rpy_calib),
+        # Multi-segment: how many random GT segments to concatenate, and the
+        # seed that makes the pick reproducible.
+        "NUM_SEGMENTS": str(args.num_segments),
+        "SEED": str(args.seed),
     }
     env_prefix = " ".join(f'{k}="{v}"' for k, v in envs.items())
     launch = (f"setsid nohup env {env_prefix} bash /workspace/_test_video.sh "
@@ -427,6 +464,12 @@ def main():
                     help="manual calibration in DEGREES 'roll pitch yaw' (e.g. "
                          "\"0.4 2.1 2.1\"). Overrides the auto global_pose estimate. "
                          "Used both for the full render and as the montage's center.")
+    ap.add_argument("--num-segments", type=int, default=1, metavar="N",
+                    help="concatenate N randomly-chosen segments (each ~1 min) into one "
+                         "video. Each gets its own calibration and a fresh recurrent "
+                         "state at the cut. e.g. --num-segments 3 --duration 180.")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="seed for the random segment pick (default 42, reproducible)")
     args = ap.parse_args()
 
     runpod = get_runpod()

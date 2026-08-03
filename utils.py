@@ -319,12 +319,38 @@ def rgb_to_yuv(rgb):
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2YUV_I420)
 
 
-def transform_frames(frames):
+def transform_frames(frames, rpy_calib=None, height=1.22):
+    '''Pre-process raw camera frames into the model's input frame.
+
+    ``rpy_calib=None`` (default) reproduces the original behaviour: only the
+    eon -> medmodel intrinsics change, with identity extrinsics. This is what
+    training and GT generation use, so leaving it None keeps those paths
+    byte-identical.
+
+    Passing ``rpy_calib`` additionally rectifies each frame into the CALIBRATED
+    frame first -- which is what openpilot does on-car: ``calibrationd``
+    estimates the camera's mounting roll/pitch/yaw, and the image is warped
+    into the calibrated frame *before* ``modeld`` sees it, so the model always
+    receives a canonically-mounted view. Without this the model sees a road
+    tilted by the mount error (~2 deg here), i.e. off its training
+    distribution, which degrades the predictions themselves rather than just
+    the overlay.
+
+    Uses openpilot's own ``pretransform_from_calib`` so the warp matches the
+    on-car pipeline exactly.
+    '''
+    pretransform = None
+    if rpy_calib is not None:
+        from common.transformations.camera import pretransform_from_calib
+        pretransform = pretransform_from_calib(
+            [rpy_calib[0], rpy_calib[1], rpy_calib[2], height])
+
     imgs_med_model = np.zeros((len(frames), 384, 512), dtype=np.uint8)
     for i, img in enumerate(frames):
-        imgs_med_model[i] = transform_img(img, 
+        imgs_med_model[i] = transform_img(img,
                                           from_intr=eon_intrinsics,
-                                          to_intr=medmodel_intrinsics, 
+                                          to_intr=medmodel_intrinsics,
+                                          pretransform=pretransform,
                                           yuv=True,
                                           output_size=(512, 256))
 

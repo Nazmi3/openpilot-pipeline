@@ -242,10 +242,13 @@ def _run_one(run_model, stacked_frame, desire, traffic_convention, recurrent_sta
     return (lanelines, road_edges, best_path), new_recurrent
 
 
-def _decode_stacked_frames(video_path, upto):
+def _decode_stacked_frames(video_path, upto, rpy_calib=None):
     """Decode + preprocess the first `upto` frames of a video into model-ready
     12-channel stacked inputs, plus the plotting RGB canvases. Used by the
-    calibration montage (which needs the model warmed up to a given frame)."""
+    calibration montage (which needs the model warmed up to a given frame).
+
+    `rpy_calib` rectifies the model input into the calibrated frame, matching
+    the on-car pipeline (see utils.transform_frames)."""
     zoom_matrix = _zoom_matrix()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -266,7 +269,7 @@ def _decode_stacked_frames(video_path, upto):
                                        zoom_matrix, PLOT_IMG_HEIGHT, PLOT_IMG_WIDTH))
     cap.release()
 
-    prepared = transform_frames(np.asarray(yuv))
+    prepared = transform_frames(np.asarray(yuv), rpy_calib=rpy_calib)
     n = len(rgb)
     stacked = np.zeros((n, 12, 128, 256), dtype=np.uint8)
     for i in range(n):
@@ -306,7 +309,9 @@ def generate_calib_montage(model_path, segment_path, output_png, rpy_base=None,
     video_path = _resolve_video_path(segment_path)
     _m, run_student = load_inference_model(model_path)
 
-    stacked, rgb = _decode_stacked_frames(video_path, frame_idx + 1)
+    # model input rectified with the base calibration (the grid below sweeps
+    # only the DRAW projection, so input stays fixed across tiles)
+    stacked, rgb = _decode_stacked_frames(video_path, frame_idx + 1, rpy_calib=rpy_base)
     n = len(rgb)
     if n == 0:
         raise RuntimeError('no frames decoded')
@@ -342,28 +347,55 @@ def generate_calib_montage(model_path, segment_path, output_png, rpy_base=None,
     return output_png
 
 
-def generate_prediction_video(model_path, segment_path, output_path,
+def generate_prediction_video(model_path, segment_paths, output_path,
                               teacher_model_path=None, rpy_calib=None,
+                              calibrate_input=True,
                               duration_s=DEFAULT_DURATION_S, fps=FPS,
                               chunk_frames=CHUNK_FRAMES):
-    """Run the model(s) over a segment and write a prediction-overlay video.
+    """Run the model(s) over one or more segments and write a prediction video.
 
     Streams frames in chunks so RAM stays bounded and progress prints as it
     goes. When ``teacher_model_path`` is given, produces a side-by-side
     (teacher | student) 1280x480 clip.
 
-    ``rpy_calib`` is the roll/pitch/yaw used to project model outputs onto
-    the raw camera image. Model predictions live in the CALIBRATED frame, so
-    rendering them on raw video with ``[0, 0, 0]`` pitches the paths off the
-    road; instead use the segment's real ``liveCalibration`` mean RPY (this
-    is what the training viz patch does too). ``None`` falls back to
-    ``utils.TRAIN_VIZ_CALIB_RPY``.
+    ``rpy_calib`` is the camera's mounting roll/pitch/yaw. It is used in the
+    two places a real car uses it:
+
+      1. INPUT (``calibrate_input=True``): each frame is rectified into the
+         calibrated frame before the model sees it -- what openpilot does
+         on-car, so ``modeld`` always gets a canonically-mounted view. Without
+         this the model sees the road tilted by the mount error, i.e. off its
+         training distribution, degrading the predictions themselves.
+      2. DRAW: predictions come out in the calibrated frame, so projecting
+         them onto the *raw* display image needs the same rpy (drawing with
+         ``[0,0,0]`` pitches the paths into the road). This mirrors openpilot's
+         UI, which overlays on the raw camera feed.
+
+    These are independent -- (1) affects prediction quality, (2) affects
+    overlay alignment -- so applying both is not double-counting.
+
+    ``rpy_calib=None`` (the normal case) resolves calibration PER SEGMENT --
+    each segment is a different drive with its own camera mount, so a single
+    fixed rpy would be wrong for all but one of them. Passing an explicit
+    ``rpy_calib`` forces that value on every segment (useful for tuning).
+
+    ``segment_paths`` may be a single path or a list; multiple segments are
+    concatenated into one video, with the model's recurrent state reset at
+    each boundary (see ``_stream_segment``).
 
     Returns (output_path, frames_written).
     """
+    if isinstance(segment_paths, (str, bytes, os.PathLike)):
+        segment_paths = [segment_paths]
+    segment_paths = list(segment_paths)
+    if not segment_paths:
+        raise ValueError('no segments given')
+
     num_frames = int(round(duration_s * fps))
     zoom_matrix = _zoom_matrix()
-    video_path = _resolve_video_path(segment_path)
+    # fail fast if any segment lacks a video, before loading models/decoding
+    for s in segment_paths:
+        _resolve_video_path(s)
 
     # Load models FIRST so a missing weight file fails before we spend
     # minutes on video decode. Order matters: student is the primary model
@@ -380,17 +412,6 @@ def generate_prediction_video(model_path, segment_path, output_path,
         _t_model, run_teacher = load_inference_model(teacher_model_path)
         printf(f'   teacher loaded in {time.time() - t0:.1f}s')
 
-    printf(f'=> Opening video: {video_path}')
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f'cv2.VideoCapture failed to open {video_path}')
-
-    ok, prev_bgr = cap.read()
-    if not ok:
-        cap.release()
-        raise RuntimeError(f'empty video: {video_path}')
-    prev_yuv = bgr_to_yuv(prev_bgr)
-
     # Output dimensions: single = W x H, comparison = 2W x H (side-by-side).
     out_w = PLOT_IMG_WIDTH * (2 if run_teacher else 1)
     out_h = PLOT_IMG_HEIGHT
@@ -398,26 +419,90 @@ def generate_prediction_video(model_path, segment_path, output_path,
     writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'),
                              fps, (out_w, out_h))
     if not writer.isOpened():
-        cap.release()
         raise RuntimeError(f'Could not open VideoWriter for: {output_path}')
 
-    # Independent recurrent states -- one per model. Teacher and student see
-    # the same input frames but their GRU trajectories diverge.
+    mode = 'teacher | student' if run_teacher else 'student only'
+    printf(f'=> {len(segment_paths)} segment(s), {num_frames} frames total '
+           f'({num_frames / fps:.0f}s) @ {fps}fps, chunks of {chunk_frames} ({mode})')
+
+    frames_written = 0
+    t_stream = time.time()
+    per_segment = []
+
+    try:
+        for seg_i, seg in enumerate(segment_paths):
+            if frames_written >= num_frames:
+                break
+            remaining = num_frames - frames_written
+
+            # Each segment is a DIFFERENT drive -> its own camera mount, so its
+            # own calibration. Resolve per segment unless one was forced.
+            seg_rpy = rpy_calib
+            if seg_rpy is None:
+                seg_rpy = load_segment_rpy(seg)
+            if seg_rpy is None:
+                printf(f'[warn] no calibration for {seg}; using zero rpy')
+                seg_rpy = [0.0, 0.0, 0.0]
+
+            seg_name = os.path.basename(seg.rstrip('/\\')) or seg
+            printf(f'--- segment {seg_i + 1}/{len(segment_paths)}: {seg_name}')
+            printf(f'    rpy(deg) = [{np.degrees(seg_rpy[0]):+.2f}, '
+                   f'{np.degrees(seg_rpy[1]):+.2f}, {np.degrees(seg_rpy[2]):+.2f}]'
+                   f'   input-calib: {"ON" if calibrate_input else "OFF"}')
+
+            n = _stream_segment(seg, writer, run_student, run_teacher,
+                                seg_rpy, calibrate_input, remaining, chunk_frames,
+                                zoom_matrix, fps, frames_written, num_frames)
+            frames_written += n
+            per_segment.append((seg, n, seg_rpy))
+    finally:
+        writer.release()
+
+    elapsed = time.time() - t_stream
+    printf(f'=> Wrote {frames_written} frames ({frames_written / fps:.1f}s of video) '
+           f'to {output_path} in {elapsed:.1f}s')
+    for seg, n, r in per_segment:
+        name = os.path.basename(seg.rstrip('/\\')) or seg
+        printf(f'     {n:5d} frames ({n / fps:5.1f}s)  '
+               f'rpy(deg)=[{np.degrees(r[0]):+.2f},{np.degrees(r[1]):+.2f},{np.degrees(r[2]):+.2f}]  '
+               f'{name}')
+    return output_path, frames_written
+
+
+def _stream_segment(segment_path, writer, run_student, run_teacher,
+                    rpy_calib, calibrate_input, max_frames, chunk_frames,
+                    zoom_matrix, fps, frames_so_far, total_frames):
+    """Stream one segment into an already-open writer. Returns frames written.
+
+    The recurrent (GRU) state is created fresh here, so it RESETS at every
+    segment boundary. Carrying it across a scene cut would feed the model
+    temporal context from a different road/drive -- training resets the
+    hidden state at segment boundaries for the same reason.
+    """
+    video_path = _resolve_video_path(segment_path)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        printf(f'[warn] could not open {video_path}; skipping segment')
+        return 0
+
+    ok, prev_bgr = cap.read()
+    if not ok:
+        cap.release()
+        printf(f'[warn] empty video {video_path}; skipping segment')
+        return 0
+    prev_yuv = bgr_to_yuv(prev_bgr)
+
+    # fresh state per segment (see docstring)
     rs_student = np.zeros((1, 512), dtype=np.float32)
     rs_teacher = np.zeros((1, 512), dtype=np.float32)
     desire = np.zeros((1, 8), dtype=np.float32)
-    # same traffic convention one-hot as training (index 1 == 1)
     traffic_convention = np.array([[0, 1]], dtype=np.float32)
 
-    frames_written = 0
-    mode = 'teacher | student' if run_teacher else 'student only'
-    printf(f'=> Streaming {num_frames} frames in chunks of {chunk_frames} ({mode})...')
+    written = 0
     chunk_i = 0
-    t_stream = time.time()
-
     try:
-        while frames_written < num_frames:
-            want = min(chunk_frames, num_frames - frames_written)
+        while written < max_frames:
+            want = min(chunk_frames, max_frames - written)
 
             # 1) decode `want` new BGR frames + convert to YUV I420
             t_read = time.time()
@@ -436,13 +521,15 @@ def generate_prediction_video(model_path, segment_path, output_path,
                     PLOT_IMG_HEIGHT, PLOT_IMG_WIDTH)
                 got += 1
             if got == 0:
-                printf('   reached end of video; stopping')
                 break
             prev_yuv = yuv_chunk[got].copy()
 
-            # 2) med-model transform: 12-channel stacked pairs
+            # 2) med-model transform: 12-channel stacked pairs.
+            #    rpy_calib rectifies into the calibrated frame first, exactly
+            #    as openpilot does on-car before modeld (see transform_frames).
             t_pre = time.time()
-            prepared = transform_frames(yuv_chunk[:got + 1])
+            prepared = transform_frames(yuv_chunk[:got + 1],
+                                        rpy_calib=rpy_calib if calibrate_input else None)
             stacked = np.zeros((got, 12, 128, 256), dtype=np.uint8)
             for i in range(got):
                 stacked[i] = np.vstack(prepared[i:i + 2])[None].reshape(12, 128, 256)
@@ -475,24 +562,19 @@ def generate_prediction_video(model_path, segment_path, output_path,
 
                 # draw_* / annotate work in RGB; cv2.VideoWriter expects BGR
                 writer.write(cv2.cvtColor(frame_out, cv2.COLOR_RGB2BGR))
-                frames_written += 1
+                written += 1
 
             chunk_i += 1
-            printf(f'   chunk {chunk_i}: +{got} frames -> {frames_written}/{num_frames}   '
+            printf(f'    chunk {chunk_i}: +{got} -> {frames_so_far + written}/{total_frames}   '
                    f'(read {t_pre - t_read:.1f}s, pre {t_inf - t_pre:.1f}s, '
                    f'inf {time.time() - t_inf:.1f}s)')
 
             if got < want:
-                printf('   reached end of video; stopping')
+                printf('    reached end of segment')
                 break
     finally:
-        writer.release()
         cap.release()
-
-    elapsed = time.time() - t_stream
-    printf(f'=> Wrote {frames_written} frames ({frames_written / fps:.1f}s of video) '
-           f'to {output_path} in {elapsed:.1f}s')
-    return output_path, frames_written
+    return written
 
 
 def _resolve_inputs():
@@ -539,8 +621,13 @@ def main():
                         help='OPTIONAL path to teacher .onnx (e.g. common/models/'
                              'supercombo.onnx). When given, output is a side-by-side '
                              '(teacher | student) 1280x480 clip.')
-    parser.add_argument('--segment', default=env_segment, required=env_segment is None,
+    parser.add_argument('--segment', default=env_segment,
                         help='path to a segment directory (with video.hevc/fcamera.hevc)')
+    parser.add_argument('--segments', nargs='+', default=None, metavar='DIR',
+                        help='MULTIPLE segment dirs, concatenated into one video. Each '
+                             'gets its own calibration (different drives = different '
+                             'camera mounts) and a fresh recurrent state at the cut. '
+                             'e.g. --segments /path/seg1 /path/seg2 /path/seg3')
     parser.add_argument('--output', default=env_output, help='output .mp4 path')
     parser.add_argument('--duration', type=float, default=DEFAULT_DURATION_S,
                         help='clip duration in seconds (default: 60)')
@@ -563,21 +650,35 @@ def main():
                         help='DEBUG: instead of a video, render frame FRAME_IDX with a '
                              'grid of candidate calibrations to a PNG (--output), to pick '
                              'the right rpy visually. e.g. --calib-montage 200')
+    parser.add_argument('--no-calibrate-input', dest='calibrate_input',
+                        action='store_false',
+                        help='feed the model the RAW uncalibrated frame instead of '
+                             'rectifying it into the calibrated frame first. Default is '
+                             'to rectify, matching what openpilot does on-car before '
+                             'modeld. Use this to A/B the effect on predictions.')
+    parser.set_defaults(calibrate_input=True)
     args = parser.parse_args()
 
     if not os.path.exists(args.model):
         parser.error(f'model not found: {args.model}')
     if args.teacher_model and not os.path.exists(args.teacher_model):
         parser.error(f'teacher model not found: {args.teacher_model}')
-    if not args.segment or not os.path.isdir(args.segment):
-        parser.error(f'segment directory not found: {args.segment}')
 
-    # Resolve rpy_calib: explicit --rpy-calib wins; otherwise auto-load from
-    # comma2k19 global_pose / liveCalibration logs. If both fail, fall through
-    # to None so the renderer uses utils.TRAIN_VIZ_CALIB_RPY (zero) with a warning.
-    log_seg = args.segment_logs or args.segment
+    segments = args.segments if args.segments else ([args.segment] if args.segment else [])
+    if not segments:
+        parser.error('no segment given: pass --segment DIR or --segments DIR [DIR ...]')
+    for s in segments:
+        if not os.path.isdir(s):
+            parser.error(f'segment directory not found: {s}')
+
+    # rpy_calib: explicit --rpy-calib forces one value on every segment.
+    # Left as None (the normal case) the renderer resolves calibration PER
+    # segment, since each is a different drive with its own camera mount.
     rpy_calib = args.rpy_calib
-    if rpy_calib is None:
+    if rpy_calib is None and len(segments) == 1:
+        # single-segment: resolve here so --segment-logs (pod stages the video
+        # locally but logs stay on the network volume) is honoured
+        log_seg = args.segment_logs or segments[0]
         rpy_calib = load_segment_rpy(log_seg, openpilot_dir=args.openpilot_dir)
         if rpy_calib is None:
             printf('[warn] no calibration found; using zero rpy '
@@ -592,14 +693,15 @@ def main():
         out_png = args.output
         if out_png.lower().endswith('.mp4'):
             out_png = out_png[:-4] + '_calib_montage.png'
-        generate_calib_montage(args.model, args.segment, out_png,
+        generate_calib_montage(args.model, segments[0], out_png,
                                rpy_base=rpy_calib, frame_idx=args.calib_montage,
                                openpilot_dir=args.openpilot_dir)
         return
 
-    generate_prediction_video(args.model, args.segment, args.output,
+    generate_prediction_video(args.model, segments, args.output,
                               teacher_model_path=args.teacher_model,
                               rpy_calib=rpy_calib,
+                              calibrate_input=args.calibrate_input,
                               duration_s=args.duration, fps=args.fps,
                               chunk_frames=args.chunk_frames)
 

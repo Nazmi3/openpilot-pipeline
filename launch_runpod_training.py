@@ -53,6 +53,7 @@ from runpod_lib import (
     VOLUME_ID, DATA_CENTER, GPU_TYPE, GPU_CANDIDATES, IMAGE, CONTAINER_DISK_GB, MOUNT_PATH,
     WANDB_ENTITY, WANDB_PROJECT, SSH_KEY, API_KEY, WANDB_KEY,
     die, get_runpod, list_resources, ssh_run, wait_for_ssh, download_from_pod,
+    sync_local_files_to_pod,
     tail_lines_from as _tail_lines_from,
     boot_pod_with_retries, terminate_pod_quiet,
 )
@@ -80,7 +81,7 @@ TORCH_INDEX=https://download.pytorch.org/whl/cu113
 
 : "${DATE_IT:=run1}" "${EPOCHS:=15}" "${BATCH:=8}" "${GEN_GT:=0}" "${AUTO_STOP:=0}"
 : "${LOG_FREQ:=10}" "${VAL_FREQ:=20}" "${CONVERT_ONLY:=0}" "${SPLIT:=0.75}" "${GEN_GT_COUNT:=0}" "${GT_ONLY:=0}"
-: "${MHP_LOSS:=0}"
+: "${MHP_LOSS:=0}" "${REINIT_HEAD:=0}" "${GRAD_CLIP:=}"
 : "${WB_ENTITY:=nazmiryuki}" "${WB_PROJECT:=openpilot-pipeline}"
 : "${WANDB_API_KEY:=}" "${RUNPOD_API_KEY:=}" "${SNPE_SDK_URL:=}"
 
@@ -357,6 +358,13 @@ else
   # the sigma-clamped Laplacian likelihood loss (train.py's --mhp_loss).
   MHP_FLAG=""
   if [ "$MHP_LOSS" = "1" ]; then MHP_FLAG="--mhp_loss"; echo ">>> using Laplacian MHP likelihood loss"; fi
+  if [ -z "$MHP_FLAG" ]; then echo ">>> using KL-divergence distillation loss (full teacher supervision)"; fi
+  # head init: default warm-starts the path-plan head from the teacher's weights
+  REINIT_FLAG=""
+  if [ "$REINIT_HEAD" = "1" ]; then REINIT_FLAG="--reinit_head"; echo ">>> re-initializing path-plan head from scratch"; fi
+  # gradient clipping (train.py defaults to inf == disabled)
+  CLIP_FLAG=""
+  if [ -n "${GRAD_CLIP:-}" ]; then CLIP_FLAG="--grad_clip $GRAD_CLIP"; echo ">>> grad clip: $GRAD_CLIP"; fi
   # WANDB_START_METHOD=thread: run wandb in a thread instead of a helper subprocess.
   # The subprocess default intermittently fails with "Error communicating with wandb
   # process" on resource-constrained pods, which crashes train.py before any epoch.
@@ -364,7 +372,8 @@ else
     WANDB_START_METHOD=thread \
     python train.py --date_it "$DATE_IT" --recordings_basedir "$DATA" \
     --batch_size "$BATCH" --epochs "$EPOCHS" --split "$SPLIT" \
-    --log_frequency "$LOG_FREQ" --val_frequency "$VAL_FREQ" $MHP_FLAG > "$TLOG" 2>&1 &
+    --log_frequency "$LOG_FREQ" --val_frequency "$VAL_FREQ" \
+    $MHP_FLAG $REINIT_FLAG $CLIP_FLAG > "$TLOG" 2>&1 &
   TRAIN_PID=$!
   while kill -0 "$TRAIN_PID" 2>/dev/null; do
     if grep -q "training_finished" "$TLOG" 2>/dev/null; then
@@ -493,12 +502,35 @@ fi
 # --------------------------------------------------------------------------------
 
 
+# Local files overlaid onto the pod's repo copy before training.
+#
+# The pod clones nikebless/openpilot-pipeline pinned at $PIN, so WITHOUT this
+# sync the pod trains with upstream code and any local change (new CLI flags,
+# loss/init changes) is silently ignored -- or crashes argparse. The provision
+# script's `git checkout $PIN` keeps these local modifications.
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+POD_REPO = "/workspace/openpilot-pipeline"
+FILES_TO_SYNC = [
+    ("utils.py",            f"{POD_REPO}/utils.py"),
+    ("train/train.py",      f"{POD_REPO}/train/train.py"),
+    ("train/model.py",      f"{POD_REPO}/train/model.py"),
+    ("train/dataloader.py", f"{POD_REPO}/train/dataloader.py"),
+    ("train/torch_to_onnx.py", f"{POD_REPO}/train/torch_to_onnx.py"),
+    ("gt_distill/generate_gt.py", f"{POD_REPO}/gt_distill/generate_gt.py"),
+    ("gt_distill/parse_logs.py", f"{POD_REPO}/gt_distill/parse_logs.py"),
+]
+
+
 def start_remote(host, port, args):
     # remove stale logs from a prior run with the same date_it BEFORE launching,
     # so the --wait poll can't see an old 'PIPELINE FINISHED' from a previous run.
     ssh_run(host, port,
             f"rm -f /workspace/train_{args.date_it}.log /workspace/launch_{args.date_it}.log",
             quiet=True, check=False)
+    # overlay local code onto the pod's clone (see FILES_TO_SYNC)
+    print("Syncing locally modified files to the pod's repo copy...")
+    if sync_local_files_to_pod(host, port, FILES_TO_SYNC, REPO_ROOT) == 0:
+        die("no local files were uploaded -- check the paths in FILES_TO_SYNC.")
     # upload the self-contained provisioning script...
     print("Uploading provisioning script to the pod...")
     if ssh_run(host, port, "cat > /workspace/_provision.sh && chmod +x /workspace/_provision.sh",
@@ -516,6 +548,8 @@ def start_remote(host, port, args):
         "LOG_FREQ": str(args.log_frequency), "VAL_FREQ": str(args.val_frequency),
         "SPLIT": str(args.split), "GEN_GT_COUNT": str(args.gen_gt_count),
         "MHP_LOSS": "1" if args.mhp_loss else "0",
+        "REINIT_HEAD": "1" if args.reinit_head else "0",
+        "GRAD_CLIP": str(args.grad_clip) if args.grad_clip is not None else "",
         "RENDER_PREVIEW": "1" if args.preview else "0",
         "GT_ONLY": "1" if args.gt_only else "0",
         "WB_ENTITY": WANDB_ENTITY, "WB_PROJECT": WANDB_PROJECT,
@@ -654,6 +688,14 @@ def main():
     ap.add_argument("--split", type=float, default=0.75,
                     help="train/val split fraction. With N GT segments, train gets round(N*split) "
                          "and val gets the rest -- each side must be >= batch_size. Default 0.75.")
+    ap.add_argument("--reinit-head", action="store_true",
+                    help="re-initialize the path-plan head from scratch (xavier) instead of "
+                         "warm-starting from the teacher's pretrained weights. Default is warm "
+                         "start: the head is 1.67M params (11.8%% of the model) and the dataset "
+                         "is <1h, so relearning it from scratch is a major accuracy loss.")
+    ap.add_argument("--grad-clip", type=float, default=None, metavar="NORM",
+                    help="gradient clip norm passed to train.py (default: disabled, i.e. inf). "
+                         "Worth setting (e.g. 1.0) when switching loss functions.")
     ap.add_argument("--mhp-loss", action="store_true",
                     help="train with the Laplacian MHP likelihood loss (numerically stable, "
                          "sigma-clamped) instead of the default KL-divergence distillation loss. "

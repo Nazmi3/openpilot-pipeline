@@ -484,6 +484,10 @@ if __name__ == "__main__":
     parser.add_argument("--lrs_thresh", type=float, default=1e-4, help="lrs threshold")
     parser.add_argument("--mhp_loss", dest='distill', help="use Laplacian MHP loss instead of distillation", action='store_false')  # "16Jan_1_seg"
     parser.add_argument("--no_recurr_warmup", dest='recurr_warmup', action='store_false')
+    parser.add_argument("--reinit_head", action='store_true',
+                        help="re-initialize the path-plan head from scratch (xavier) instead of "
+                             "warm-starting from the teacher's pretrained weights. Default is "
+                             "warm start, which is much stronger on a small dataset.")
     parser.add_argument("--no_wandb", dest="no_wandb", action="store_true", help="disable wandb")
     parser.add_argument("--recordings_basedir", type=dir_path, default="/gpfs/space/projects/Bolt/comma_recordings", help="path to base directory with recordings")
     parser.add_argument("--recurr_warmup", dest='recurr_warmup', action='store_true')
@@ -579,7 +583,8 @@ if __name__ == "__main__":
     printf('Batches in val_loader:', val_loader_len)
 
     printf("=>Loading the model")
-    comma_model = load_trainable_model(path_to_supercombo, trainable_layers=pathplan_layer_names)
+    comma_model = load_trainable_model(path_to_supercombo, trainable_layers=pathplan_layer_names,
+                                       reinit_head=args.reinit_head)
     comma_model = comma_model.to(device)
 
     wandb.watch(comma_model) # Log the gradients  
