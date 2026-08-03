@@ -198,6 +198,74 @@ def _load_segment_rpy_from_comma2k19(segment_path, min_speed=3.0):
     return [float(x) for x in np.median(rpy, axis=0)]
 
 
+# The 33 future time anchors (seconds) the model predicts.
+# Mirrors gt_real/generate_gt.py / openpilot's modeldata.h T_IDXS.
+T_IDXS = np.array([
+    0.,          0.00976562,  0.0390625,   0.08789062,  0.15625,
+    0.24414062,  0.3515625,   0.47851562,  0.625,       0.79101562,
+    0.9765625,   1.18164062,  1.40625,     1.65039062,  1.9140625,
+    2.19726562,  2.5,         2.82226562,  3.1640625,   3.52539062,
+    3.90625,     4.30664062,  4.7265625,   5.16601562,  5.625,
+    6.10351562,  6.6015625,   7.11914062,  7.65625,     8.21289062,
+    8.7890625,   9.38476562, 10.,
+])
+
+
+def load_segment_real_path(segment_path):
+    """Per-frame REAL driven trajectory (sensor/GPS ground truth) from a
+    comma2k19 segment's `global_pose/`.
+
+    This is the same quantity `gt_real/generate_gt.py` builds, but sourced from
+    comma2k19's numpy pose arrays instead of `liveLocationKalman` in the log --
+    that path needs `capnp`/`laika`, which aren't installed here.
+
+    For each frame i we express the car's FUTURE ECEF positions in frame i's
+    own device frame, sampled at the 33 T_IDXS time anchors (0..10s):
+
+        device_from_ecef = rot_from_quat(orientations[i]).T
+        path[i, k]       = device_from_ecef @ (positions[future_k] - positions[i])
+
+    The device frame is x-forward / y-right / z-down -- the same convention the
+    model's calib frame uses (they differ only by the ~2-3 deg mount rotation,
+    which is exactly what `_load_segment_rpy_from_comma2k19` measures). So these
+    points are drawn with rpy=[0,0,0]: they are already relative to the physical,
+    tilted device, which is what the raw image shows.
+
+    Returns (N, 33, 3) float32 with NaN for frames that lack a full 10s future
+    (the last ~200 frames @20Hz), or None if global_pose is unavailable.
+    """
+    gp_dir = os.path.join(segment_path, 'global_pose')
+    try:
+        positions = np.load(os.path.join(gp_dir, 'frame_positions'))
+        orientations = np.load(os.path.join(gp_dir, 'frame_orientations'))
+        times = np.load(os.path.join(gp_dir, 'frame_times'))
+    except Exception as e:
+        printf(f'[warn] no global_pose for real-GT path under {segment_path} ({e})')
+        return None
+
+    from common.transformations.orientation import rot_from_quat
+
+    R = rot_from_quat(orientations)          # (N,3,3) ecef_from_device
+    n = len(times)
+    out = np.full((n, len(T_IDXS), 3), np.nan, dtype=np.float32)
+
+    n_valid = 0
+    for i in range(n):
+        t_rel = times - times[i]
+        # first future sample at/after each anchor
+        idxs = np.searchsorted(t_rel, T_IDXS)
+        if idxs[-1] >= n:
+            break                             # no full 10s horizon left
+        rel_ecef = positions[idxs] - positions[i]
+        # device_from_ecef @ v  ==  v @ R  (R is ecef_from_device)
+        out[i] = (rel_ecef @ R[i]).astype(np.float32)
+        n_valid = i + 1
+
+    printf(f'   real-GT path: {n_valid}/{n} frames have a full '
+           f'{T_IDXS[-1]:.0f}s future horizon')
+    return out
+
+
 def load_segment_rpy(segment_path, openpilot_dir=None):
     """Best-effort calibration RPY for a segment: try real liveCalibration
     logs first (ground truth when available), then comma2k19's global_pose
@@ -349,7 +417,7 @@ def generate_calib_montage(model_path, segment_path, output_png, rpy_base=None,
 
 def generate_prediction_video(model_path, segment_paths, output_path,
                               teacher_model_path=None, rpy_calib=None,
-                              calibrate_input=True,
+                              calibrate_input=True, show_real_gt=False,
                               duration_s=DEFAULT_DURATION_S, fps=FPS,
                               chunk_frames=CHUNK_FRAMES):
     """Run the model(s) over one or more segments and write a prediction video.
@@ -412,8 +480,10 @@ def generate_prediction_video(model_path, segment_paths, output_path,
         _t_model, run_teacher = load_inference_model(teacher_model_path)
         printf(f'   teacher loaded in {time.time() - t0:.1f}s')
 
-    # Output dimensions: single = W x H, comparison = 2W x H (side-by-side).
-    out_w = PLOT_IMG_WIDTH * (2 if run_teacher else 1)
+    # Output dimensions: one panel per source, left to right
+    # (teacher | sensor/GPS ground truth | student).
+    n_panels = 1 + (1 if run_teacher else 0) + (1 if show_real_gt else 0)
+    out_w = PLOT_IMG_WIDTH * n_panels
     out_h = PLOT_IMG_HEIGHT
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or '.', exist_ok=True)
     writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'),
@@ -450,9 +520,12 @@ def generate_prediction_video(model_path, segment_paths, output_path,
                    f'{np.degrees(seg_rpy[1]):+.2f}, {np.degrees(seg_rpy[2]):+.2f}]'
                    f'   input-calib: {"ON" if calibrate_input else "OFF"}')
 
+            seg_real = load_segment_real_path(seg) if show_real_gt else None
+
             n = _stream_segment(seg, writer, run_student, run_teacher,
                                 seg_rpy, calibrate_input, remaining, chunk_frames,
-                                zoom_matrix, fps, frames_written, num_frames)
+                                zoom_matrix, fps, frames_written, num_frames,
+                                real_path=seg_real)
             frames_written += n
             per_segment.append((seg, n, seg_rpy))
     finally:
@@ -471,7 +544,8 @@ def generate_prediction_video(model_path, segment_paths, output_path,
 
 def _stream_segment(segment_path, writer, run_student, run_teacher,
                     rpy_calib, calibrate_input, max_frames, chunk_frames,
-                    zoom_matrix, fps, frames_so_far, total_frames):
+                    zoom_matrix, fps, frames_so_far, total_frames,
+                    real_path=None):
     """Stream one segment into an already-open writer. Returns frames written.
 
     The recurrent (GRU) state is created fresh here, so it RESETS at every
@@ -500,6 +574,10 @@ def _stream_segment(segment_path, writer, run_student, run_teacher,
 
     written = 0
     chunk_i = 0
+    # frame 0 of the video was consumed above as the "previous" frame, so the
+    # first row we write corresponds to video frame 1 (global_pose is indexed
+    # by video frame).
+    frame_index0 = 1
     try:
         while written < max_frames:
             want = min(chunk_frames, max_frames - written)
@@ -545,9 +623,9 @@ def _stream_segment(segment_path, writer, run_student, run_teacher,
                     rpy_calib=rpy_calib,
                     plot_img_width=PLOT_IMG_WIDTH, plot_img_height=PLOT_IMG_HEIGHT)
 
-                if run_teacher is None:
-                    frame_out = student_rgb
-                else:
+                panels = []
+
+                if run_teacher is not None:
                     # Teacher
                     (t_ll, t_re, t_path), rs_teacher = _run_one(
                         run_teacher, stacked[i:i + 1], desire, traffic_convention, rs_teacher)
@@ -556,9 +634,32 @@ def _stream_segment(segment_path, writer, run_student, run_teacher,
                         rpy_calib=rpy_calib,
                         plot_img_width=PLOT_IMG_WIDTH, plot_img_height=PLOT_IMG_HEIGHT)
                     _annotate(teacher_rgb, 'teacher (supercombo)')
-                    _annotate(student_rgb, 'student (trained)')
-                    # side-by-side: teacher | student
-                    frame_out = np.concatenate([teacher_rgb, student_rgb], axis=1)
+                    panels.append(teacher_rgb)
+
+                if real_path is not None:
+                    # Sensor/GPS ground truth: the trajectory actually driven.
+                    # Already in the device frame -> rpy=[0,0,0]. No lanelines or
+                    # road edges exist for it, so only the path is drawn.
+                    fidx = frame_index0 + written          # video frame this row came from
+                    gt_rgb = rgb_chunk[i].copy()
+                    pts = real_path[fidx] if fidx < len(real_path) else None
+                    if pts is not None and np.isfinite(pts).all():
+                        gt_plan = np.zeros((2, len(T_IDXS), 15), dtype=np.float32)
+                        gt_plan[0, :, :3] = pts
+                        gt_rgb = draw_visualization(
+                            None, None, gt_plan, gt_rgb,
+                            rpy_calib=[0.0, 0.0, 0.0],
+                            plot_img_width=PLOT_IMG_WIDTH, plot_img_height=PLOT_IMG_HEIGHT,
+                            fill_color=(255, 128, 0), line_color=(255, 200, 0))
+                        _annotate(gt_rgb, 'sensor/GPS ground truth')
+                    else:
+                        _annotate(gt_rgb, 'sensor/GPS GT (no 10s future)')
+                    panels.append(gt_rgb)
+
+                _annotate(student_rgb, 'student (trained)')
+                panels.append(student_rgb)
+
+                frame_out = panels[0] if len(panels) == 1 else np.concatenate(panels, axis=1)
 
                 # draw_* / annotate work in RGB; cv2.VideoWriter expects BGR
                 writer.write(cv2.cvtColor(frame_out, cv2.COLOR_RGB2BGR))
@@ -657,6 +758,10 @@ def main():
                              'to rectify, matching what openpilot does on-car before '
                              'modeld. Use this to A/B the effect on predictions.')
     parser.set_defaults(calibrate_input=True)
+    parser.add_argument('--show-real-gt', action='store_true',
+                        help="add a middle panel with the REAL driven trajectory from "
+                             "the segment's sensor/GPS poses (comma2k19 global_pose), i.e. "
+                             "what gt_real/generate_gt.py builds. Gives teacher | GT | student.")
     args = parser.parse_args()
 
     if not os.path.exists(args.model):
@@ -702,6 +807,7 @@ def main():
                               teacher_model_path=args.teacher_model,
                               rpy_calib=rpy_calib,
                               calibrate_input=args.calibrate_input,
+                              show_real_gt=args.show_real_gt,
                               duration_s=args.duration, fps=args.fps,
                               chunk_frames=args.chunk_frames)
 

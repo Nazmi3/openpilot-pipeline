@@ -290,7 +290,7 @@ def visualize_predictions(model, device, train_segment_for_viz, val_segment_for_
                                 }
 
                 outs = model(**inputs)
-                recurr_input = outs[:, 5960:] # refeeding the recurrent state
+                recurr_input = outs[:, -512:]  # refeeding the recurrent state (last 512 == GRU state in every supercombo variant)
                 preds = outs.detach().cpu().numpy() #(1,6472)
 
                 lanelines, road_edges, best_path = extract_preds(preds)[0]
@@ -388,7 +388,7 @@ def train_batch(run, model, optimizer, stacked_frames, gt_plans, gt_plans_probs,
             outputs = model(**inputs_to_pretained_model)  # -- > [32,6472]
 
         plan_predictions = outputs[:, :4955].clone()  # -- > [32,4955]
-        recurr_out = outputs[:, 5960:].clone()  # -- > [32,512] important to refeed state of GRU
+        recurr_out = outputs[:, -512:].clone()  # -- > [32,512] important to refeed state of GRU
 
         with Timing(timings, 'path_plan_loss'):
             loss_func = plan_distill_loss if run.config.distill else plan_mhp_loss
@@ -439,7 +439,7 @@ def validate_batch(model, val_stacked_frames, val_plans, val_plans_probs, recurr
                                          "initial_state": recurr_input}
 
         val_outputs = model(**val_inputs_to_pretained_model)  # --> [32,6472]
-        recurr_input = val_outputs[:, 5960:].clone()  # --> [32,512] important to refeed state of GRU
+        recurr_input = val_outputs[:, -512:].clone()  # --> [32,512] important to refeed state of GRU
         val_path_prediction = val_outputs[:, :4955].clone()  # --> [32,4955]
 
         loss_func = plan_distill_loss if run.config.distill else plan_mhp_loss

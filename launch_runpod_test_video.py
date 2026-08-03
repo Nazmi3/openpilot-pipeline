@@ -86,7 +86,7 @@ mkdir -p "$STAGE"
 
 : "${DATE_IT:=run1}" "${DURATION:=60}" "${FPS:=20}"
 : "${SEGMENT:=}" "${OUTPUT:=}"
-: "${NUM_SEGMENTS:=1}" "${SEED:=42}"
+: "${NUM_SEGMENTS:=1}" "${SEED:=42}" "${SHOW_REAL_GT:=0}"
 
 echo ">>> test-video start $(date)"
 
@@ -198,7 +198,11 @@ if [ -z "$OUTPUT" ]; then
   if [ -n "${MONTAGE_FRAME:-}" ]; then
     OUTPUT="$WS/prediction_${DATE_IT}_calib_montage.png"
   elif [ "${COMPARE_TEACHER:-1}" = "1" ]; then
-    OUTPUT="$WS/prediction_${DATE_IT}_${DURATION}s_teacher_vs_student.mp4"
+    if [ "${SHOW_REAL_GT:-0}" = "1" ]; then
+      OUTPUT="$WS/prediction_${DATE_IT}_${DURATION}s_teacher_gt_student.mp4"
+    else
+      OUTPUT="$WS/prediction_${DATE_IT}_${DURATION}s_teacher_vs_student.mp4"
+    fi
   else
     OUTPUT="$WS/prediction_${DATE_IT}_${DURATION}s.mp4"
   fi
@@ -212,6 +216,13 @@ TEACHER_ARG=""
 if [ -z "${MONTAGE_FRAME:-}" ] && [ "${COMPARE_TEACHER:-1}" = "1" ] && [ -f "$STAGE/supercombo.onnx" ]; then
   TEACHER_ARG="--teacher-model $STAGE/supercombo.onnx"
   echo ">>> teacher:   $STAGE/supercombo.onnx (side-by-side)"
+fi
+
+# Optional middle panel: real driven trajectory from sensor/GPS poses.
+REALGT_ARG=""
+if [ "${SHOW_REAL_GT:-0}" = "1" ]; then
+  REALGT_ARG="--show-real-gt"
+  echo ">>> real GT panel: ON (sensor/GPS trajectory from global_pose)"
 fi
 
 # Debug: calibration montage instead of a video.
@@ -240,7 +251,7 @@ CUDA_VISIBLE_DEVICES="" \
   OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}" \
   PYTHONPATH="$REPO" python -u test_prediction_video.py \
   --model "$LOCAL_MODEL" --segments $SEG_ARGS --output "$OUTPUT" \
-  --duration "$DURATION" --fps "$FPS" $TEACHER_ARG $MONTAGE_ARG $CALIB_ARG \
+  --duration "$DURATION" --fps "$FPS" $TEACHER_ARG $MONTAGE_ARG $CALIB_ARG $REALGT_ARG \
   --openpilot-dir "$REPO/common"
 RC=$?
 
@@ -315,6 +326,7 @@ def start_remote(host, port, args):
         "RPY_CALIB_RAD": _rpy_deg_to_rad_str(args.rpy_calib),
         # Multi-segment: how many random GT segments to concatenate, and the
         # seed that makes the pick reproducible.
+        "SHOW_REAL_GT": "1" if args.show_real_gt else "0",
         "NUM_SEGMENTS": str(args.num_segments),
         "SEED": str(args.seed),
     }
@@ -464,6 +476,10 @@ def main():
                     help="manual calibration in DEGREES 'roll pitch yaw' (e.g. "
                          "\"0.4 2.1 2.1\"). Overrides the auto global_pose estimate. "
                          "Used both for the full render and as the montage's center.")
+    ap.add_argument("--show-real-gt", action="store_true",
+                    help="add a middle panel with the REAL driven trajectory from the "
+                         "segment's sensor/GPS poses (comma2k19 global_pose), i.e. what "
+                         "gt_real/generate_gt.py builds: teacher | GT | student.")
     ap.add_argument("--num-segments", type=int, default=1, metavar="N",
                     help="concatenate N randomly-chosen segments (each ~1 min) into one "
                          "video. Each gets its own calibration and a fresh recurrent "
