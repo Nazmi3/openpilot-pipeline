@@ -26,9 +26,6 @@ from utils import bgr_to_yuv, transform_frames, printf, FULL_FRAME_SIZE, create_
 
 MIN_SEGMENT_LENGTH = 1190
 
-path_to_videos_cache = os.path.join(PATH_TO_CACHE, 'videos.txt')
-path_to_plans_cache = os.path.join(PATH_TO_CACHE, 'plans.txt')
-
 
 def load_transformed_video(path_to_segment, plot_img_width=640, plot_img_height=480, seq_len=1190):
     
@@ -159,7 +156,8 @@ def configure_worker(worker_id):
 
 class CommaDataset(IterableDataset):
 
-    def __init__(self, recordings_basedir, batch_size, train_split=0.8, seq_len=32, validation=False, shuffle=False, seed=42):
+    def __init__(self, recordings_basedir, batch_size, train_split=0.8, seq_len=32, validation=False, shuffle=False, seed=42,
+                 gt_file_name='gt_distill.h5', min_segment_len=MIN_SEGMENT_LENGTH):
         super(CommaDataset, self).__init__()
         """
         Dataloader for Comma model train. pipeline
@@ -170,6 +168,13 @@ class CommaDataset(IterableDataset):
             as used in the official comma pipeline.
 
         Args: ------------------
+            gt_file_name: which per-segment GT file to load. 'gt_distill.h5' for the
+                teacher-distillation GT (train with distillation loss), or 'gt_real.h5'
+                for the sensor/pose-based GT (train with --mhp_loss). Both expose the
+                same 'plans'/'plans_prob' datasets.
+            min_segment_len: minimum number of GT frames a segment must have to be
+                used. Sensor GT is ~200 frames shorter than teacher GT (no future
+                horizon at the tail), so lower this (e.g. ~950) when using gt_real.h5.
         """
         self.batch_size = batch_size
         self.recordings_basedir = recordings_basedir
@@ -178,11 +183,21 @@ class CommaDataset(IterableDataset):
         self.shuffle = shuffle
         self.seq_len = seq_len
         self.seed = seed
+        self.gt_file_name = gt_file_name
+        self.min_segment_len = min_segment_len
+
+        # Keep the teacher GT's original cache filenames for backward compat;
+        # give any other GT source its own suffixed caches so they don't clobber.
+        stem = os.path.splitext(gt_file_name)[0]
+        suffix = '' if gt_file_name == 'gt_distill.h5' else f'_{stem}'
+        self.videos_cache = os.path.join(PATH_TO_CACHE, f'videos{suffix}.txt')
+        self.plans_cache = os.path.join(PATH_TO_CACHE, f'plans{suffix}.txt')
+        self.segments_cache = os.path.join(PATH_TO_CACHE, f'segments{suffix}.txt')
 
         if self.recordings_basedir is None or not os.path.exists(self.recordings_basedir):
             raise TypeError("recordings path is wrong")
 
-        self.hevc_file_paths, self.gt_file_paths = self.get_paths(self.recordings_basedir, min_segment_len=MIN_SEGMENT_LENGTH)
+        self.hevc_file_paths, self.gt_file_paths = self.get_paths(self.recordings_basedir, min_segment_len=self.min_segment_len)
         n_segments = len(self.hevc_file_paths)
         printf("Total # segments", n_segments)
 
@@ -204,7 +219,7 @@ class CommaDataset(IterableDataset):
 
     # NOTE: this is a rough estimate (less or equal to the true value). Do NOT rely on this number.
     def __len__(self):
-        batches_per_segment = MIN_SEGMENT_LENGTH // self.seq_len
+        batches_per_segment = self.min_segment_len // self.seq_len
         return len(self.segment_indices) * batches_per_segment // self.batch_size
 
     def __iter__(self):
@@ -282,14 +297,14 @@ class CommaDataset(IterableDataset):
             segment_gts.close()
             segment_video.release()
 
-    def get_segment_dirs(self, base_dir, gt_file_name='gt_distill.h5'):
+    def get_segment_dirs(self, base_dir):
         '''Get paths to segments that have ground truths.'''
 
-        if os.path.exists(segments_cache := os.path.join(PATH_TO_CACHE, 'segments.txt')):
-            with open(segments_cache, 'r') as f:
+        if os.path.exists(self.segments_cache):
+            with open(self.segments_cache, 'r') as f:
                 segment_dirs = [line.strip() for line in f.readlines()]
         else:
-            gt_files = sorted(glob.glob(base_dir + f'/**/{gt_file_name}', recursive=True))
+            gt_files = sorted(glob.glob(base_dir + f'/**/{self.gt_file_name}', recursive=True))
             segment_dirs = sorted(list(set([os.path.dirname(f) for f in gt_files])))
 
         return segment_dirs
@@ -299,25 +314,25 @@ class CommaDataset(IterableDataset):
 
         os.makedirs(PATH_TO_CACHE, exist_ok=True)
 
-        if os.path.exists(path_to_videos_cache) and os.path.exists(path_to_plans_cache):
+        if os.path.exists(self.videos_cache) and os.path.exists(self.plans_cache):
             printf('Using cached paths to videos and GTs...')
             video_paths = []
             gt_paths = []
-            with open(path_to_videos_cache, 'r') as f:
+            with open(self.videos_cache, 'r') as f:
                 video_paths = f.read().splitlines()
 
-            with open(path_to_plans_cache, 'r') as f:
+            with open(self.plans_cache, 'r') as f:
                 gt_paths = f.read().splitlines()
-                
+
         else:
             printf('Resolving paths to videos and GTs...')
             segment_dirs = self.get_segment_dirs(base_dir)
 
             # prevent duplicate writes
-            with open(path_to_videos_cache, 'w'): pass
-            with open(path_to_plans_cache, 'w'): pass
+            with open(self.videos_cache, 'w'): pass
+            with open(self.plans_cache, 'w'): pass
 
-            gt_filename = 'gt_distill.h5'
+            gt_filename = self.gt_file_name
             video_filenames = ['fcamera.hevc', 'video.hevc']
 
             video_paths = []
@@ -343,12 +358,12 @@ class CommaDataset(IterableDataset):
                         found_one_video = 0 <= len(video_files) <= 1
 
                         if found_one_video:
-                            with open(path_to_videos_cache, 'a') as video_paths_f:
+                            with open(self.videos_cache, 'a') as video_paths_f:
                                 video_path = os.path.join(segment_dir, video_files[0])
                                 video_paths.append(video_path)
                                 video_paths_f.write(video_path + '\n')  # cache it
 
-                            with open(path_to_plans_cache, 'a') as gt_paths_f:
+                            with open(self.plans_cache, 'a') as gt_paths_f:
                                 gt_paths.append(gt_file_path)
                                 gt_paths_f.write(gt_file_path + '\n')  # cache it
                         else:

@@ -491,9 +491,18 @@ if __name__ == "__main__":
     parser.add_argument("--seq_len", type=int, default=100, help="sequence length")
     parser.add_argument("--split", type=float, default=0.94, help="train/val split")
     parser.add_argument("--val_frequency", type=int, default=400, help="run validation every this many steps")
+    parser.add_argument("--gt_file_name", type=str, default='gt_distill.h5',
+                        help="per-segment GT file: 'gt_distill.h5' (teacher, use with distillation loss) "
+                             "or 'gt_real.h5' (sensor/pose-based, use with --mhp_loss)")
+    parser.add_argument("--min_segment_len", type=int, default=1190,
+                        help="min GT frames per segment. Lower (~950) for gt_real.h5, which has no future horizon at the tail")
     parser.set_defaults(recurr_warmup=True)
     parser.set_defaults(distill=True)
     args = parser.parse_args()
+
+    if not args.distill and args.gt_file_name == 'gt_distill.h5':
+        printf("[WARNING] --mhp_loss set but gt_file_name is still 'gt_distill.h5'. "
+               "Pass --gt_file_name gt_real.h5 to train on sensor-based GT.")
  
     # for reproducibility
     torch.manual_seed(args.seed)
@@ -539,7 +548,7 @@ if __name__ == "__main__":
     printf(f"=>Batch size is {batch_size}")
 
     train_dataset = CommaDataset(comma_recordings_basedir, batch_size=batch_size, train_split=train_val_split, seq_len=seq_len,
-                                 shuffle=True, seed=42)
+                                 shuffle=True, seed=42, gt_file_name=args.gt_file_name, min_segment_len=args.min_segment_len)
     train_segment_for_viz = os.path.dirname(train_dataset.hevc_file_paths[train_dataset.segment_indices[0]]) # '/home/nikita/data/2021-09-14--09-19-21/2'
     train_loader = DataLoader(train_dataset, batch_size=None, num_workers=num_workers, shuffle=False, prefetch_factor=prefetch_factor,
                               persistent_workers=True, collate_fn=None, worker_init_fn=configure_worker)
@@ -548,7 +557,7 @@ if __name__ == "__main__":
     train_loader = BackgroundGenerator(train_loader)
 
     val_dataset = CommaDataset(comma_recordings_basedir, batch_size=batch_size, train_split=train_val_split, seq_len=seq_len,
-                               validation=True, shuffle=True, seed=42)
+                               validation=True, shuffle=True, seed=42, gt_file_name=args.gt_file_name, min_segment_len=args.min_segment_len)
     val_segment_for_viz = os.path.dirname(val_dataset.hevc_file_paths[val_dataset.segment_indices[0]]) # '/home/nikita/data/2021-09-19--10-22-59/18'
     val_loader = DataLoader(val_dataset, batch_size=None, num_workers=num_workers, shuffle=False, prefetch_factor=prefetch_factor,
                             persistent_workers=True, collate_fn=None, worker_init_fn=configure_worker)
