@@ -12,3 +12,10 @@ core.*
 train/tmp
 cache
 nohup.out
+
+# Model artifacts downloaded from the RunPod volume by the launchers
+# (.pth/.onnx/.dlc + rendered prediction videos). These are large,
+# regenerable build outputs -- same reason train/nets is ignored above.
+# Re-fetch them with launch_runpod_training.py / launch_runpod_test_video.py --wait.
+trained_models/
+*.pth
