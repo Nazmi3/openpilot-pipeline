@@ -121,9 +121,34 @@ fine, so 1.41 runtime accepts 1.43 containers). `--snpe-major 1` in
 (`Qualcomm_AI_Runtime_Community`) serves 2.x only, a plain Qualcomm ID shows "No
 releases found", QPM is empty, and Kommu no longer has theirs.
 
-### OPEN LEAD: upgrade the DEVICE to the 2.x runtime instead
+### CLOSED: upgrading the DEVICE to the 2.x runtime does NOT work
 
-Rather than downgrade the converter, ship QAIRT 2.x's own runtime to the device.
+Tested on the device 2026-08-04, all 13 aarch64-android backend libs staged
+(`libSNPE`, `libQnnCpu`, `libQnnGpu`, `libQairtCpu`, `libQairtGpu`, system +
+BackendExtensions). The 2.48 `libSNPE.so` loads and reports its version, and it
+opens our 2.48 `.dlc` fine -- but **every runtime fails to initialise**:
+
+| runtime | error from `isRuntimeAvailable()` (all 3 check options) |
+|---|---|
+| CPU | `2006 QNN_COMMON_ERROR_PLATFORM_NOT_SUPPORTED: Attempt to use QNN API on an unsupported platform` |
+| GPU / GPU_FLOAT16 | `5000 QNN_BACKEND_ERROR_CANNOT_INITIALIZE: Backend failed to initialize` |
+| DSP | `1200 No backend library matched for this build and target` |
+
+Forcing `SNPEBuilder::build()` anyway fails at the first layer:
+`No backend could validate Op=Conv_0 Type=Conv2d`.
+
+Note **CPU** fails with an explicit *platform not supported* -- so this is not an
+Adreno 530 problem and not a missing-library problem, it is QNN 2.x refusing
+MSM8996 outright. Do not retry this with a different 2.x version or more libs.
+
+The one useful positive: the 2.48 headers alias into `zdl::`
+(`ALIAS_IN_ZDL_NAMESPACE`) and bukapilot-style code compiles against them
+unchanged -- irrelevant now, but recorded so nobody re-derives it.
+
+=> The ONLY path to a deployable model is an SNPE converter <= 1.43.
+
+### Historical detail: what upgrading WOULD have needed
+
 Verified by reading the 2.48 SDK zip's central directory (range requests, no full
 download needed):
 
@@ -135,14 +160,9 @@ download needed):
   `ALIAS_IN_ZDL_NAMESPACE(SNPE, SNPEFactory)` -- so bukapilot's `zdl::` code is
   source-compatible.
 
-Unresolved, and the thing to test first: whether 2.48's GPU/OpenCL backend actually
-supports **Adreno 530** (2016). DSP/HTP is definitely out -- 2.48 bottoms out at
-Hexagon V66/V68 and MSM8996 is v60 -- so it is GPU or CPU only. Also unknown whether
-`thneed`'s OpenCL capture still works against 2.x's kernel sequence.
-
-Cheap decisive test: push `libSNPE.so` + `libQairtGpu.so` from the 2.48 zip to the
-device and load an existing 2.48 `.dlc` with a small program (clang++ works on the
-device; that is how the 1.41.0.2173 version string above was obtained).
+All of which was true, and none of which mattered -- see the CLOSED section above.
+The staging kit (probe source, deploy/rollback scripts, extracted libs+headers) is
+at `~/snpe248_gate0` if it is ever needed for a different device.
 
 ---
 
