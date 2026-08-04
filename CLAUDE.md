@@ -59,31 +59,90 @@ bukapilot's 4 layers were verified **plan-exclusive** by forward reachability
 Remember these are `onnx2pytorch` names = `{op_type}_{output_tensor_name}`,
 e.g. bukapilot `Gemm_958` == raw ONNX node `Gemm_330`.
 
-### OPEN QUESTION — resolve before spending GPU time
+### WORKING ASSUMPTION: bukapilot runs the SAME 6472 model as this repo
 
-`../bukapilot/selfdrive/modeld/models/driving.h` does **not** match the shipped
-`models/supercombo.onnx`:
+**No retargeting is being done.** The table above is kept only for the day the
+assumption breaks.
 
-* header implies plan `= 5 x (33*15*2 + 1) = 4955`; ONNX has **9905**
-* header `ModelOutputLinesProb = 4 x 2 = 8` floats; ONNX has **4**
+Justification: `../bukapilot/selfdrive/modeld/models/driving.h` is the code that
+*parses* the model at runtime, and it describes plan
+`= 5 x (33*15*2 + 1) = 4955` and `ModelOutputLinesProb = 4 x 2 = 8` floats —
+i.e. exactly THIS repo's 6472 teacher, giving
+`NET_OUTPUT_SIZE = 5960 + 512 = 6472`. The 11327-wide
+`../bukapilot/models/supercombo.onnx` does NOT match that parser, so it is
+presumed stale/unused.
 
-So the in-tree C++ parser describes a *different* model than the checked-in
-ONNX (the header actually matches THIS repo's 6472 teacher). Before retargeting,
-confirm which artifact bukapilot actually deploys — the `.onnx`, the `.thneed`
-(compiled, possibly from another source), or a model fetched at runtime.
-Retargeting to the wrong one silently produces a useless model.
+=> `run2.onnx` / `run2.dlc` are already the correct shape for bukapilot.
 
-### What retargeting still requires (not done yet)
+Revisit only if the deployed model misbehaves in a way that smells like a
+layout mismatch (garbage paths, nonsense lane probabilities). To re-check:
+compare `NET_OUTPUT_SIZE` implied by `driving.h` against the actual model's
+output width.
 
-1. Regenerate GT with bukapilot's supercombo as teacher (`gt_distill.h5` here
-   was made with THIS repo's 6472 teacher — incompatible targets). Costs a
-   full GT pass over the dataset.
-2. Point `train.py`'s `pathplan_layer_names` at the bukapilot layer set above.
-3. Replace hardcoded slices with the retarget map (or derive from the model).
-4. Retrain + re-render comparison video.
+### Deploying to bukapilot
 
-Note `run1.pth` / `run2.pth` are for the **6472** teacher and cannot be loaded
-into bukapilot at all.
+bukapilot picks its runner at BUILD time in `selfdrive/modeld/models/driving.cc`
+(`use_thneed = not GetOption('no_thneed')` in `selfdrive/modeld/SConscript`):
+
+| build | loads | this pipeline produces it? |
+|---|---|---|
+| default (`USE_THNEED`) | `models/supercombo.thneed` | **not directly** — built ON DEVICE from the `.dlc`, see below |
+| `--no-thneed`, ONNX runner | `models/supercombo.onnx` | yes (`run2.onnx`) |
+| `--no-thneed`, SNPE runner | `models/supercombo.dlc` | yes (`run2.dlc`) |
+
+**`.thneed` is compiled FROM the `.dlc`, not from the `.onnx`.** This is NOT the
+tinygrad flow of newer openpilot. `selfdrive/modeld/SConscript` ends with:
+
+```
+compile ../../models/supercombo.dlc ../../models/supercombo.thneed --binary
+```
+
+where `thneed/compile.cc` does `SNPEModel(argv[1], ..., USE_GPU_RUNTIME)`, runs one
+inference, and dumps the captured OpenCL kernels. So the real deploy chain is
+**sequential**: `.pth -> .onnx -> .dlc -> .thneed`, and the `.dlc` must be loadable
+by the device's SNPE runtime even for a thneed build.
+
+### The device needs an SNPE **1.41** DLC — 2.x will not load
+
+Verified on the device (`comma@172.20.10.2:8022`, comma two / Android):
+
+- runtime version, via `zdl::SNPE::SNPEFactory::getLibraryVersion()`: **1.41.0.2173**
+- comma's own shipped `dmonitoring_model_q.dlc` says `converter-version=1.41.0.2173`
+- our `.dlc` built with the default QAIRT SDK says `converterVersion 2.48.0.260626`
+  and running `thneed/compile` on it fails with:
+  `error_code=310; error_message=Dlc read failure. Failed to read archive file`
+
+So with the **runtime the device currently has**, a `.dlc` must come from an SNPE
+converter <= 1.43 (comma's own shipped `supercombo.dlc` was 1.43.0.2307 and loads
+fine, so 1.41 runtime accepts 1.43 containers). `--snpe-major 1` in
+`launch_runpod_training.py` exists for that.
+
+**Sourcing a 1.x SDK has failed so far**: Qualcomm's public S3
+(`Qualcomm_AI_Runtime_Community`) serves 2.x only, a plain Qualcomm ID shows "No
+releases found", QPM is empty, and Kommu no longer has theirs.
+
+### OPEN LEAD: upgrade the DEVICE to the 2.x runtime instead
+
+Rather than downgrade the converter, ship QAIRT 2.x's own runtime to the device.
+Verified by reading the 2.48 SDK zip's central directory (range requests, no full
+download needed):
+
+- `lib/aarch64-android/libSNPE.so` exists; `.note.android.ident` says
+  **minSdkVersion 21** and the device is **API 23** -> not an OS blocker.
+- `lib/aarch64-android/libQairtGpu.so` links `libOpenCL_Adreno.so` / `libOpenCL.so`;
+  the device has `/system/vendor/lib64/libOpenCL.so`.
+- The 2.x C++ headers still alias into the old namespace --
+  `ALIAS_IN_ZDL_NAMESPACE(SNPE, SNPEFactory)` -- so bukapilot's `zdl::` code is
+  source-compatible.
+
+Unresolved, and the thing to test first: whether 2.48's GPU/OpenCL backend actually
+supports **Adreno 530** (2016). DSP/HTP is definitely out -- 2.48 bottoms out at
+Hexagon V66/V68 and MSM8996 is v60 -- so it is GPU or CPU only. Also unknown whether
+`thneed`'s OpenCL capture still works against 2.x's kernel sequence.
+
+Cheap decisive test: push `libSNPE.so` + `libQairtGpu.so` from the 2.48 zip to the
+device and load an existing 2.48 `.dlc` with a small program (clang++ works on the
+device; that is how the 1.41.0.2173 version string above was obtained).
 
 ---
 

@@ -19,6 +19,10 @@ Two modes:
     drawn on the left, the student (the trained ``.pth``) on the right, so
     distillation-driven divergences are visually obvious.
 
+Frames where the **driver** was steering (rather than openpilot) get a
+steering-wheel badge, decoded from the segment's raw CAN -- see
+``load_segment_driver_steering``. Disable with ``--no-driver-badge``.
+
 Design note: unlike ``dataloader.load_transformed_video`` (which decodes all
 frames into RAM before returning), this test **streams**: read N frames ->
 preprocess -> infer -> write -> next chunk. That keeps memory bounded (the
@@ -266,6 +270,195 @@ def load_segment_real_path(segment_path):
     return out
 
 
+# --- driver-steering (manual override) detection -------------------------------
+#
+# comma2k19 has NO `steering_torque` channel and no reachable engagement flag:
+# `processed_log/CAN/` holds only {radar, raw_can, speed, steering_angle,
+# wheel_speed}, and `carState.steeringPressed` lives in `raw_log.bz2` behind
+# capnp/cereal, which this environment does not have (the same reason
+# `gt_distill.parse_logs` always fails here).
+#
+# So we decode `raw_can` directly. Verified against the dataset itself: the
+# addresses present are Toyota's, with no Honda addresses at all -- this fleet
+# is a RAV4. Two messages matter, and together they give the signal exactly
+# rather than by inference:
+#
+#   0x2E4 STEERING_LKA        -- openpilot's OWN steer command, seen on bus 128
+#                                (the "transmitted by us" flag). STEER_REQUEST
+#                                and STEER_TORQUE_CMD are non-zero only while
+#                                openpilot is actually steering.
+#   0x260 STEER_TORQUE_SENSOR -- the EPS report; STEER_TORQUE_DRIVER is the
+#                                torque the human is applying.
+#
+# "The driver is steering" therefore means: openpilot is not commanding steer,
+# OR it is but the human is overriding it.
+#
+# Note most comma2k19 segments are pure manual driving -- of the 49 segments
+# with ground truth, 28 have openpilot never engaged, 11 always, 10 mixed.
+CAN_STEERING_LKA = 0x2E4          # 740
+CAN_STEER_TORQUE_SENSOR = 0x260   # 608
+# openpilot's own Toyota `STEER_THRESHOLD`: |driver torque| above this is what
+# it reports as `carState.steeringPressed`.
+TOYOTA_STEER_THRESHOLD = 100.0
+# Keep the badge up this long after torque drops back below the release level,
+# so it doesn't strobe through the zero-crossings of a normal steering input.
+DRIVER_STEER_HOLD_S = 0.5
+# Release level as a fraction of the trigger level (Schmitt trigger).
+DRIVER_STEER_LO_FRAC = 0.6
+
+
+def _load_can_signal(segment_path, keyword):
+    """Load a comma2k19 `processed_log/CAN/<signal>/{t,value}` pair.
+
+    Matches `keyword` exactly first, then by substring. Returns (t, value) as
+    1-D float64, or None."""
+    can_dir = os.path.join(segment_path, 'processed_log', 'CAN')
+    if not os.path.isdir(can_dir):
+        return None
+    try:
+        names = sorted(os.listdir(can_dir))
+    except OSError:
+        return None
+    candidates = [n for n in names if n == keyword] + \
+                 [n for n in names if n != keyword and keyword in n]
+    for name in candidates:
+        d = os.path.join(can_dir, name)
+        try:
+            t = np.asarray(np.load(os.path.join(d, 't')), dtype=np.float64)
+            v = np.asarray(np.load(os.path.join(d, 'value')), dtype=np.float64)
+        except Exception:
+            continue
+        if v.ndim > 1:
+            v = v[:, 0]
+        n = min(len(t), len(v))
+        if n >= 2:
+            return t[:n], v[:n]
+    return None
+
+
+def _load_raw_can(segment_path):
+    """Load `processed_log/CAN/raw_can` as (t, address, data), `data` (N,8) uint8."""
+    d = os.path.join(segment_path, 'processed_log', 'CAN', 'raw_can')
+    try:
+        t = np.asarray(np.load(os.path.join(d, 't')), dtype=np.float64)
+        addr = np.asarray(np.load(os.path.join(d, 'address')), dtype=np.int64)
+        data = np.load(os.path.join(d, 'data'))
+    except Exception as e:
+        printf(f'[info] no readable raw_can under {segment_path} ({e})')
+        return None
+    # `data` has numpy dtype 'S8'. Indexing a single element STRIPS trailing NUL
+    # bytes, so deriving a record width from one element silently misaligns
+    # every field -- that produced a completely bogus decode once already.
+    # Going through .tobytes() keeps the fixed-width 8-byte records.
+    b = np.frombuffer(data.tobytes(), dtype=np.uint8).reshape(len(data), 8)
+    n = min(len(t), len(addr), len(b))
+    return t[:n], addr[:n], b[:n]
+
+
+def _be_int16(b, off):
+    """Signed big-endian 16-bit field at byte offset `off` of an (N,8) frame."""
+    return (b[:, off].astype(np.int32) << 8 | b[:, off + 1]).astype(np.int16)
+
+
+def _schmitt(mag, hi, lo, hold_frames):
+    """Latching threshold: rise at `hi`, hold while above `lo`, and keep holding
+    for `hold_frames` after that. Returns a bool array the same length as `mag`."""
+    active = np.zeros(len(mag), dtype=bool)
+    on = False
+    hold = 0
+    for i, v in enumerate(mag):
+        if not np.isfinite(v):
+            v = 0.0
+        if v >= hi:
+            on, hold = True, hold_frames
+        elif on and v >= lo:
+            hold = hold_frames
+        elif hold > 0:
+            hold -= 1
+        else:
+            on = False
+        active[i] = on
+    return active
+
+
+def load_segment_driver_steering(segment_path, torque_thresh=None, fps=FPS):
+    """Per-frame "the driver is steering, not openpilot" flag for a comma2k19
+    segment, decoded from raw CAN (see the module-level notes above).
+
+    A frame counts as driver-steered when openpilot is not commanding steer, or
+    when it is but the human is overriding it (|driver torque| over
+    `torque_thresh`, defaulting to openpilot's own Toyota `STEER_THRESHOLD`).
+
+    Returns a dict with per-frame `active` (bool) and `angle` (degrees, or None
+    when the segment has no steering-angle channel), indexed by video frame, or
+    None if the segment has no usable CAN data.
+    """
+    can = _load_raw_can(segment_path)
+    if can is None:
+        printf('[warn] no raw_can for this segment; driver-steering badge disabled')
+        return None
+    t_can, addr, frames = can
+
+    try:
+        frame_times = np.asarray(
+            np.load(os.path.join(segment_path, 'global_pose', 'frame_times')),
+            dtype=np.float64)
+    except Exception as e:
+        printf(f'[warn] no frame_times to align CAN against ({e}); '
+               f'driver-steering badge disabled')
+        return None
+
+    m_lka = addr == CAN_STEERING_LKA
+    if not m_lka.any():
+        printf(f'[warn] no STEERING_LKA (0x{CAN_STEERING_LKA:X}) on this CAN '
+               f'bus -- not a Toyota capture? driver-steering badge disabled')
+        return None
+
+    # STEER_REQUEST is bit 0 of byte 0; STEER_TORQUE_CMD is bytes[1:3] big-endian.
+    lka_t = t_can[m_lka]
+    lka = frames[m_lka]
+    engaged = ((lka[:, 0] & 1) == 1) | (_be_int16(lka, 1) != 0)
+
+    # Engagement is a boolean state, so hold the last sample forward rather than
+    # interpolating between samples.
+    idx = np.clip(np.searchsorted(lka_t, frame_times, side='right') - 1,
+                  0, len(lka_t) - 1)
+    engaged_f = engaged[idx]
+
+    thresh = TOYOTA_STEER_THRESHOLD if torque_thresh is None else float(torque_thresh)
+    override = np.zeros(len(frame_times), dtype=bool)
+    m_eps = addr == CAN_STEER_TORQUE_SENSOR
+    if m_eps.any():
+        drv = _be_int16(frames[m_eps], 1).astype(np.float64)
+        drv_f = np.abs(np.interp(frame_times, t_can[m_eps], drv))
+        override = _schmitt(drv_f, thresh, thresh * DRIVER_STEER_LO_FRAC,
+                            int(round(DRIVER_STEER_HOLD_S * fps)))
+        printf('   |driver torque| p50/p90/p99 = '
+               + '/'.join(f'{v:.0f}' for v in np.percentile(drv_f, [50, 90, 99]))
+               + f'  (override threshold {thresh:.0f})')
+    else:
+        printf(f'[info] no STEER_TORQUE_SENSOR (0x{CAN_STEER_TORQUE_SENSOR:X}); '
+               f'using engagement alone')
+
+    active = (~engaged_f) | override
+
+    eng_pct = engaged_f.mean() * 100
+    printf(f'   openpilot steering {eng_pct:.0f}% of frames, '
+           f'driver steering {active.mean() * 100:.0f}%')
+    if eng_pct < 1:
+        printf('   [note] openpilot never commanded steer here, so the badge '
+               'stays up throughout -- correct, not a bug: the clip is entirely '
+               'human-driven.')
+
+    angle = None
+    ang = _load_can_signal(segment_path, 'steering_angle')
+    if ang is not None:
+        angle = np.interp(frame_times, ang[0], ang[1])
+
+    return {'active': active, 'angle': angle, 'thresh': thresh,
+            'engaged': engaged_f}
+
+
 def load_segment_rpy(segment_path, openpilot_dir=None):
     """Best-effort calibration RPY for a segment: try real liveCalibration
     logs first (ground truth when available), then comma2k19's global_pose
@@ -294,6 +487,63 @@ def _annotate(rgb, label):
                 (0, 0, 0), _LABEL_THICK + 1, cv2.LINE_AA)
     cv2.putText(rgb, label, org, _LABEL_FONT, _LABEL_SCALE,
                 (255, 255, 255), _LABEL_THICK, cv2.LINE_AA)
+    return rgb
+
+
+# amber, the colour openpilot uses for "human has the wheel"
+_DRIVER_BADGE_COLOR = (255, 170, 40)
+
+
+def _draw_steering_wheel(img, cx, cy, r, color, thickness=2):
+    """A minimal steering-wheel glyph: rim, hub, and the classic 3 spokes
+    (left, right, down). Drawn with cv2 primitives so there's no font/asset
+    dependency to ship to the pod."""
+    cv2.circle(img, (cx, cy), r, color, thickness, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), max(2, r // 3), color, -1, cv2.LINE_AA)
+    hub = max(2, r // 3)
+    cv2.line(img, (cx - r, cy), (cx - hub, cy), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (cx + hub, cy), (cx + r, cy), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (cx, cy + hub), (cx, cy + r), color, thickness, cv2.LINE_AA)
+
+
+def _draw_driver_badge(rgb, angle_deg=None):
+    """Stamp the "driver is steering" badge in the top-right. In-place on `rgb`.
+
+    The steering angle is shown alongside it when the segment has that channel:
+    it costs nothing, and it makes a mis-calibrated torque threshold obvious
+    (a badge lit at a dead-straight 0 deg is clearly wrong)."""
+    h, w = rgb.shape[:2]
+    bh, pad, icon_r = 40, 10, 13
+    # measure rather than hardcode: the angle string is 5-9 chars wide depending
+    # on sign and magnitude ("+3 deg" vs "-180 deg"), and an overflowing one
+    # used to run past the badge border.
+    (tw, _), _ = cv2.getTextSize('DRIVER', _LABEL_FONT, 0.62, 2)
+    aw = 0
+    ang_txt = None
+    if angle_deg is not None:
+        # no degree sign: cv2's Hershey fonts are ASCII-only
+        ang_txt = f'{angle_deg:+.0f} deg'
+        (aw, _), _ = cv2.getTextSize(ang_txt, _LABEL_FONT, 0.55, 1)
+        aw += 10                                  # gap before the angle
+    bw = pad + 2 * icon_r + 8 + tw + aw + pad
+
+    x1, y1 = w - bw - 12, 10
+    x2, y2 = x1 + bw, y1 + bh
+
+    # translucent dark plate so the badge reads over bright sky or pavement
+    overlay = rgb.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.45, rgb, 0.55, 0, dst=rgb)
+    cv2.rectangle(rgb, (x1, y1), (x2, y2), _DRIVER_BADGE_COLOR, 1, cv2.LINE_AA)
+
+    cx = x1 + pad + icon_r
+    _draw_steering_wheel(rgb, cx, y1 + bh // 2, icon_r, _DRIVER_BADGE_COLOR, 2)
+    tx = cx + icon_r + 8
+    cv2.putText(rgb, 'DRIVER', (tx, y1 + 27), _LABEL_FONT, 0.62,
+                _DRIVER_BADGE_COLOR, 2, cv2.LINE_AA)
+    if ang_txt is not None:
+        cv2.putText(rgb, ang_txt, (tx + tw + 10, y1 + 27),
+                    _LABEL_FONT, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
     return rgb
 
 
@@ -418,6 +668,7 @@ def generate_calib_montage(model_path, segment_path, output_png, rpy_base=None,
 def generate_prediction_video(model_path, segment_paths, output_path,
                               teacher_model_path=None, rpy_calib=None,
                               calibrate_input=True, show_real_gt=False,
+                              show_driver_badge=True, driver_torque_thresh=None,
                               duration_s=DEFAULT_DURATION_S, fps=FPS,
                               chunk_frames=CHUNK_FRAMES):
     """Run the model(s) over one or more segments and write a prediction video.
@@ -521,11 +772,13 @@ def generate_prediction_video(model_path, segment_paths, output_path,
                    f'   input-calib: {"ON" if calibrate_input else "OFF"}')
 
             seg_real = load_segment_real_path(seg) if show_real_gt else None
+            seg_driver = (load_segment_driver_steering(seg, driver_torque_thresh, fps)
+                          if show_driver_badge else None)
 
             n = _stream_segment(seg, writer, run_student, run_teacher,
                                 seg_rpy, calibrate_input, remaining, chunk_frames,
                                 zoom_matrix, fps, frames_written, num_frames,
-                                real_path=seg_real)
+                                real_path=seg_real, driver=seg_driver)
             frames_written += n
             per_segment.append((seg, n, seg_rpy))
     finally:
@@ -545,7 +798,7 @@ def generate_prediction_video(model_path, segment_paths, output_path,
 def _stream_segment(segment_path, writer, run_student, run_teacher,
                     rpy_calib, calibrate_input, max_frames, chunk_frames,
                     zoom_matrix, fps, frames_so_far, total_frames,
-                    real_path=None):
+                    real_path=None, driver=None):
     """Stream one segment into an already-open writer. Returns frames written.
 
     The recurrent (GRU) state is created fresh here, so it RESETS at every
@@ -624,6 +877,8 @@ def _stream_segment(segment_path, writer, run_student, run_teacher,
                     plot_img_width=PLOT_IMG_WIDTH, plot_img_height=PLOT_IMG_HEIGHT)
 
                 panels = []
+                fidx = frame_index0 + written      # video frame this row came from
+                gt_rgb = None
 
                 if run_teacher is not None:
                     # Teacher
@@ -640,7 +895,6 @@ def _stream_segment(segment_path, writer, run_student, run_teacher,
                     # Sensor/GPS ground truth: the trajectory actually driven.
                     # Already in the device frame -> rpy=[0,0,0]. No lanelines or
                     # road edges exist for it, so only the path is drawn.
-                    fidx = frame_index0 + written          # video frame this row came from
                     gt_rgb = rgb_chunk[i].copy()
                     pts = real_path[fidx] if fidx < len(real_path) else None
                     if pts is not None and np.isfinite(pts).all():
@@ -659,7 +913,21 @@ def _stream_segment(segment_path, writer, run_student, run_teacher,
                 _annotate(student_rgb, 'student (trained)')
                 panels.append(student_rgb)
 
+                # "Driver has the wheel" badge. It describes the RECORDING, not
+                # any one model, so it goes on the ground-truth panel when there
+                # is one -- that's the panel showing what the human actually did.
+                # Falls back to the composed frame's top-right otherwise.
+                driver_on = (driver is not None and fidx < len(driver['active'])
+                             and bool(driver['active'][fidx]))
+                if driver_on:
+                    ang = driver['angle']
+                    ang = float(ang[fidx]) if ang is not None else None
+                    if gt_rgb is not None:
+                        _draw_driver_badge(gt_rgb, ang)
+
                 frame_out = panels[0] if len(panels) == 1 else np.concatenate(panels, axis=1)
+                if driver_on and gt_rgb is None:
+                    _draw_driver_badge(frame_out, ang)
 
                 # draw_* / annotate work in RGB; cv2.VideoWriter expects BGR
                 writer.write(cv2.cvtColor(frame_out, cv2.COLOR_RGB2BGR))
@@ -762,6 +1030,19 @@ def main():
                         help="add a middle panel with the REAL driven trajectory from "
                              "the segment's sensor/GPS poses (comma2k19 global_pose), i.e. "
                              "what gt_real/generate_gt.py builds. Gives teacher | GT | student.")
+    parser.add_argument('--no-driver-badge', dest='show_driver_badge',
+                        action='store_false',
+                        help="don't overlay the steering-wheel badge marking frames "
+                             'where the DRIVER is steering rather than openpilot '
+                             '(decoded from the segment\'s raw CAN).')
+    parser.set_defaults(show_driver_badge=True)
+    parser.add_argument('--driver-torque-thresh', type=float, default=None,
+                        metavar='T',
+                        help='|driver steering torque| above which the human counts as '
+                             'OVERRIDING while openpilot is engaged. Default: '
+                             f'{TOYOTA_STEER_THRESHOLD:.0f}, openpilot\'s own Toyota '
+                             'STEER_THRESHOLD. Frames where openpilot is not steering '
+                             'at all count as driver-steered regardless of this.')
     args = parser.parse_args()
 
     if not os.path.exists(args.model):
@@ -808,6 +1089,8 @@ def main():
                               rpy_calib=rpy_calib,
                               calibrate_input=args.calibrate_input,
                               show_real_gt=args.show_real_gt,
+                              show_driver_badge=args.show_driver_badge,
+                              driver_torque_thresh=args.driver_torque_thresh,
                               duration_s=args.duration, fps=args.fps,
                               chunk_frames=args.chunk_frames)
 

@@ -61,6 +61,9 @@ from runpod_lib import (
 SNPE_SDK_URL  = os.environ.get("SNPE_SDK_URL",
     "https://softwarecenter.qualcomm.com/api/download/software/sdks/"
     "Qualcomm_AI_Runtime_Community/All/2.48.0.260626/v2.48.0.260626.zip")
+# SNPE 1.x zips are login-gated on developer.qualcomm.com, so there is no usable
+# default -- pass --snpe-sdk-url (or set SNPE1_SDK_URL) when using --snpe-major 1.
+SNPE1_SDK_URL = os.environ.get("SNPE1_SDK_URL", "")
 
 # --------------------------------------------------------------------------------
 # The idempotent provisioning + training script that runs ON THE POD. It reads all
@@ -83,7 +86,7 @@ TORCH_INDEX=https://download.pytorch.org/whl/cu113
 : "${LOG_FREQ:=10}" "${VAL_FREQ:=20}" "${CONVERT_ONLY:=0}" "${SPLIT:=0.75}" "${GEN_GT_COUNT:=0}" "${GT_ONLY:=0}"
 : "${MHP_LOSS:=0}" "${REINIT_HEAD:=0}" "${GRAD_CLIP:=}"
 : "${WB_ENTITY:=nazmiryuki}" "${WB_PROJECT:=openpilot-pipeline}"
-: "${WANDB_API_KEY:=}" "${RUNPOD_API_KEY:=}" "${SNPE_SDK_URL:=}"
+: "${WANDB_API_KEY:=}" "${RUNPOD_API_KEY:=}" "${SNPE_SDK_URL:=}" "${SNPE_MAJOR:=2}"
 
 echo ">>> provision start $(date)"
 
@@ -405,73 +408,153 @@ else
 fi
 
 if [ "$GT_ONLY" != "1" ] && [ -f "$MODEL_ONNX" ] && [ -n "$SNPE_SDK_URL" ]; then
-  echo ">>> setting up QAIRT/SNPE SDK for .onnx -> .dlc"
-  SNPE_DIR="$WS/snpe_sdk"
-  if [ ! -d "$SNPE_DIR/qairt" ]; then
-    mkdir -p "$SNPE_DIR"
-    echo ">>> downloading QAIRT SDK (~2.3GB, one-time; this can take several minutes)..."
-    curl -fsSL -o /tmp/snpe_sdk.zip "$SNPE_SDK_URL"
-    echo ">>> unpacking QAIRT SDK..."
-    unzip -q /tmp/snpe_sdk.zip -d "$SNPE_DIR"; rm -f /tmp/snpe_sdk.zip
-    echo ">>> QAIRT SDK ready"
-  fi
-  # the zip root is qairt/<version>/...; find the version dir (= QAIRT_SDK_ROOT)
-  QAIRT_SDK_ROOT=$(find "$SNPE_DIR/qairt" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
-  SNPE_BIN="${QAIRT_SDK_ROOT:-}/bin/x86_64-linux-clang/snpe-onnx-to-dlc"
+  # SNPE_MAJOR picks the converter generation, and they are NOT interchangeable:
+  #   2 = QAIRT / SNPE 2.x -> zip root qairt/<ver>/, converter needs python3.10
+  #   1 = SNPE 1.x         -> zip root snpe-<ver>/,  converter needs python3.6
+  # bukapilot (openpilot 0.8.13) links the SNPE 1.x C++ API (namespace zdl, see
+  # ../bukapilot/third_party/snpe/include/), whose runtime cannot load a DLC written
+  # by the 2.x converter. A .dlc meant for the device must be built with SNPE_MAJOR=1.
+  # Separate cache dirs so both SDKs can coexist on the volume.
+  if [ "$SNPE_MAJOR" = "1" ]; then SNPE_DIR="$WS/snpe_sdk1"; else SNPE_DIR="$WS/snpe_sdk"; fi
+  echo ">>> setting up SNPE ${SNPE_MAJOR}.x SDK for .onnx -> .dlc ($SNPE_DIR)"
 
-  if [ -n "$QAIRT_SDK_ROOT" ] && [ -f "$SNPE_BIN" ]; then
-    # snpe-onnx-to-dlc is a python script (qti.aisw.converters) that needs Python 3.10
-    # on Ubuntu 22.04 with pinned deps, kept in its OWN venv (must not pollute the
-    # conda training env, whose numpy/onnx/etc. versions differ).
-    SNPE_VENV="$WS/snpe_venv"
-    # The converter's compiled extension (libPyIrGraph310.so) dlopen()s
-    # libpython3.10.so.1.0. apt packages live in the EPHEMERAL container root (NOT
-    # the network volume), so python3.10 + libpython3.10 must be (re)installed on
-    # EVERY pod boot -- even when the venv already exists on the volume.
-    # libc++1/libc++abi1: the converter's extension is built with clang/libc++
-    # (the base image only ships libstdc++, so libc++.so.1 is otherwise missing).
-    echo ">>> ensuring python3.10 + libpython3.10 + libc++ present (needed by the converter)"
-    apt-get install -y -qq python3.10 python3.10-venv python3-distutils libpython3.10 \
-      libc++1 libc++abi1 >/dev/null 2>&1 || true
-    # Fallback: locate libpython3.10.so.1.0 so we can add its dir to LD_LIBRARY_PATH
-    # in case apt put it somewhere off the default loader path.
-    LIBPY=$(find /usr/lib /usr/local/lib /opt -name 'libpython3.10.so*' 2>/dev/null | head -1)
-    LIBPY_DIR=""; [ -n "$LIBPY" ] && LIBPY_DIR=$(dirname "$LIBPY")
-    if [ ! -x "$SNPE_VENV/bin/python" ]; then
-      echo ">>> creating dedicated python3.10 venv for the SNPE converter"
-      python3.10 -m venv "$SNPE_VENV" --without-pip 2>/dev/null \
-        || echo ">>> [warn] failed to create SNPE venv (python3.10 missing?)"
-      "$SNPE_VENV/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  find_sdk_root() {
+    if [ "$SNPE_MAJOR" = "1" ]; then
+      # 1.x zips unpack as snpe-<version>/ at the root
+      find "$SNPE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'snpe-*' 2>/dev/null | head -1
+    else
+      # 2.x zips unpack as qairt/<version>/
+      find "$SNPE_DIR/qairt" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1
     fi
-    if [ -x "$SNPE_VENV/bin/python" ]; then
-      # shellcheck disable=SC1091
-      source "$SNPE_VENV/bin/activate"
-      if ! PYTHONPATH="$QAIRT_SDK_ROOT/lib/python:${PYTHONPATH:-}" python -c "import onnx, qti.aisw" 2>/dev/null; then
-        echo ">>> installing SNPE converter python deps (one-time)"
-        python -m pip install -q --upgrade pip
-        python -m pip install -q "onnx==1.19.1"
-        PYTHONPATH="$QAIRT_SDK_ROOT/lib/python:${PYTHONPATH:-}" \
-          python "$QAIRT_SDK_ROOT/bin/check-python-dependency" \
-          || echo ">>> [warn] some SNPE python deps failed to install"
+  }
+  SDK_ROOT=$(find_sdk_root)
+  if [ -z "$SDK_ROOT" ]; then
+    mkdir -p "$SNPE_DIR"
+    echo ">>> downloading SNPE ${SNPE_MAJOR}.x SDK (one-time; this can take several minutes)..."
+    curl -fsSL -o /tmp/snpe_sdk.zip "$SNPE_SDK_URL"
+    echo ">>> unpacking SDK..."
+    unzip -q /tmp/snpe_sdk.zip -d "$SNPE_DIR"; rm -f /tmp/snpe_sdk.zip
+    SDK_ROOT=$(find_sdk_root)
+    [ -n "$SDK_ROOT" ] && echo ">>> SDK ready: $SDK_ROOT"
+  fi
+  SNPE_BIN="${SDK_ROOT:-}/bin/x86_64-linux-clang/snpe-onnx-to-dlc"
+
+  if [ -n "$SDK_ROOT" ] && [ -f "$SNPE_BIN" ]; then
+    # libc++1/libc++abi1: the converter's compiled extension is built with
+    # clang/libc++ (the base image only ships libstdc++, so libc++.so.1 is
+    # otherwise missing). apt packages live in the EPHEMERAL container root, not
+    # the network volume, so this must run on EVERY pod boot.
+    apt-get install -y -qq libc++1 libc++abi1 >/dev/null 2>&1 || true
+    export SNPE_ROOT="$SDK_ROOT"
+    CONV_ONNX="$MODEL_ONNX"
+    RUN_CONV=0
+
+    if [ "$SNPE_MAJOR" = "1" ]; then
+      # SNPE 1.x's converter is a python3.6 script and Ubuntu 22.04 has no
+      # python3.6 package -- build the interpreter with conda instead. Kept in its
+      # own env so it can't disturb the training env.
+      echo ">>> ensuring python3.6 conda env for the SNPE 1.x converter"
+      conda activate base
+      if [ ! -d "$CONDA/envs/snpe1" ]; then
+        conda create -y -q -n snpe1 python=3.6 >/dev/null 2>&1 \
+          || echo ">>> [warn] failed to create the snpe1 conda env"
       fi
-      # Pin numpy to the version Qualcomm's compiled extension expects (numpy 2.x
-      # breaks its C ABI). Enforced every run since the guard above may skip reinstall.
-      python -c "import numpy; assert numpy.__version__ == '1.26.4'" 2>/dev/null \
-        || python -m pip install -q "numpy==1.26.4"
-      echo ">>> running snpe-onnx-to-dlc..."
+      if conda activate snpe1 2>/dev/null; then
+        # Versions the 1.x converter was validated against. onnx>1.8 emits IR
+        # versions its protobuf schema can't parse; numpy>=1.20 breaks its C ABI.
+        python -c "import onnx, numpy" 2>/dev/null \
+          || pip install -q "onnx==1.8.1" "numpy==1.19.5" "protobuf==3.17.3" pyyaml \
+          || echo ">>> [warn] some SNPE 1.x python deps failed to install"
+        # libpython3.6m.so lives in the conda env; the converter's extension
+        # dlopen()s it by name, so its dir has to be on LD_LIBRARY_PATH.
+        LIBPY_DIR="$CONDA/envs/snpe1/lib"
+        # torch exports IR version 7; the 1.x converter's bundled onnx schema tops
+        # out at 6. The opset-9 graph itself is unchanged by the downgrade, so
+        # clamping the field is safe and avoids a re-export.
+        CONV_ONNX="${MODEL_ONNX%.onnx}_ir6.onnx"
+        python - "$MODEL_ONNX" "$CONV_ONNX" <<'PY' || CONV_ONNX="$MODEL_ONNX"
+import sys, onnx
+m = onnx.load(sys.argv[1])
+if m.ir_version > 6:
+    print('>>> clamping ONNX ir_version %d -> 6 for the SNPE 1.x converter' % m.ir_version)
+    m.ir_version = 6
+onnx.save(m, sys.argv[2])
+PY
+        RUN_CONV=1
+      fi
+    else
+      # snpe-onnx-to-dlc is a python script (qti.aisw.converters) that needs Python
+      # 3.10 on Ubuntu 22.04 with pinned deps, kept in its OWN venv (must not pollute
+      # the conda training env, whose numpy/onnx/etc. versions differ).
+      SNPE_VENV="$WS/snpe_venv"
+      # The converter's compiled extension (libPyIrGraph310.so) dlopen()s
+      # libpython3.10.so.1.0. apt packages live in the EPHEMERAL container root (NOT
+      # the network volume), so python3.10 + libpython3.10 must be (re)installed on
+      # EVERY pod boot -- even when the venv already exists on the volume.
+      echo ">>> ensuring python3.10 + libpython3.10 present (needed by the converter)"
+      apt-get install -y -qq python3.10 python3.10-venv python3-distutils libpython3.10 \
+        >/dev/null 2>&1 || true
+      # Fallback: locate libpython3.10.so.1.0 so we can add its dir to LD_LIBRARY_PATH
+      # in case apt put it somewhere off the default loader path.
+      LIBPY=$(find /usr/lib /usr/local/lib /opt -name 'libpython3.10.so*' 2>/dev/null | head -1)
+      LIBPY_DIR=""; [ -n "$LIBPY" ] && LIBPY_DIR=$(dirname "$LIBPY")
+      if [ ! -x "$SNPE_VENV/bin/python" ]; then
+        echo ">>> creating dedicated python3.10 venv for the SNPE converter"
+        python3.10 -m venv "$SNPE_VENV" --without-pip 2>/dev/null \
+          || echo ">>> [warn] failed to create SNPE venv (python3.10 missing?)"
+        "$SNPE_VENV/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+      fi
+      if [ -x "$SNPE_VENV/bin/python" ]; then
+        # shellcheck disable=SC1091
+        source "$SNPE_VENV/bin/activate"
+        if ! PYTHONPATH="$SDK_ROOT/lib/python:${PYTHONPATH:-}" python -c "import onnx, qti.aisw" 2>/dev/null; then
+          echo ">>> installing SNPE converter python deps (one-time)"
+          python -m pip install -q --upgrade pip
+          python -m pip install -q "onnx==1.19.1"
+          PYTHONPATH="$SDK_ROOT/lib/python:${PYTHONPATH:-}" \
+            python "$SDK_ROOT/bin/check-python-dependency" \
+            || echo ">>> [warn] some SNPE python deps failed to install"
+        fi
+        # Pin numpy to the version Qualcomm's compiled extension expects (numpy 2.x
+        # breaks its C ABI). Enforced every run since the guard above may skip reinstall.
+        python -c "import numpy; assert numpy.__version__ == '1.26.4'" 2>/dev/null \
+          || python -m pip install -q "numpy==1.26.4"
+        RUN_CONV=1
+      fi
+    fi
+
+    if [ "$RUN_CONV" = "1" ]; then
+      echo ">>> running snpe-onnx-to-dlc (SNPE ${SNPE_MAJOR}.x)..."
+      # Drop any DLC left by a previous run (possibly from the OTHER SNPE major),
+      # so the success check below can't be fooled by a stale file.
+      rm -f "$MODEL_DLC"
       # The ONNX is exported with a dynamic batch axis, so SNPE needs each input's
       # concrete shape via -d. Batch is fixed to 1 (openpilot runs supercombo at
       # batch 1 on-device). Shapes come from train/torch_to_onnx.py's example inputs.
-      PYTHONPATH="$QAIRT_SDK_ROOT/lib/python:${PYTHONPATH:-}" \
-        LD_LIBRARY_PATH="$QAIRT_SDK_ROOT/lib/x86_64-linux-clang:${LIBPY_DIR:+$LIBPY_DIR:}${LD_LIBRARY_PATH:-}" \
-        python "$SNPE_BIN" --input_network "$MODEL_ONNX" --output_path "$MODEL_DLC" \
-        -d input_imgs 1,12,128,256 \
-        -d desire 1,8 \
-        -d traffic_convention 1,2 \
-        -d initial_state 1,512 \
-        && echo ">>> DLC conversion done: $MODEL_DLC" \
-        || echo ">>> [warn] DLC conversion failed"
-      deactivate 2>/dev/null || true
+      run_converter() {
+        PYTHONPATH="$SDK_ROOT/lib/python:${PYTHONPATH:-}" \
+          LD_LIBRARY_PATH="$SDK_ROOT/lib/x86_64-linux-clang:${LIBPY_DIR:+$LIBPY_DIR:}${LD_LIBRARY_PATH:-}" \
+          python "$SNPE_BIN" "$1" "$CONV_ONNX" "$2" "$MODEL_DLC" \
+          -d input_imgs 1,12,128,256 \
+          -d desire 1,8 \
+          -d traffic_convention 1,2 \
+          -d initial_state 1,512
+      }
+      # Flag names drifted across SNPE releases: 2.x and late 1.x take
+      # --input_network/--output_path, mid 1.x --model_path/--output_path, and
+      # early 1.x --model_path/--dlc. Try newest first and fall back.
+      run_converter --input_network --output_path \
+        || run_converter --model_path --output_path \
+        || run_converter --model_path --dlc \
+        || true
+      if [ -f "$MODEL_DLC" ]; then
+        echo ">>> DLC conversion done: $MODEL_DLC ($(stat -c%s "$MODEL_DLC") bytes)"
+      else
+        echo ">>> [warn] DLC conversion failed"
+      fi
+      [ "$CONV_ONNX" != "$MODEL_ONNX" ] && rm -f "$CONV_ONNX"
+      # venv uses `deactivate`, the 1.x conda env uses `conda deactivate`
+      deactivate 2>/dev/null || conda deactivate 2>/dev/null || true
     fi
   else
     echo ">>> [warn] snpe-onnx-to-dlc not found under $SNPE_DIR (bad SDK zip layout?)"
@@ -537,7 +620,13 @@ def start_remote(host, port, args):
                stdin=PROVISION_SCRIPT) is None:
         die("failed to upload provisioning script over SSH")
     # ...and run it fully detached with all parameters passed via env.
-    snpe_url = getattr(args, "snpe_sdk_url", None) or SNPE_SDK_URL
+    snpe_major = str(getattr(args, "snpe_major", 2))
+    # a 2.x URL is useless to the 1.x converter, so don't silently fall back to it
+    snpe_url = (getattr(args, "snpe_sdk_url", None)
+                or (SNPE1_SDK_URL if snpe_major == "1" else SNPE_SDK_URL))
+    if snpe_major == "1" and not snpe_url:
+        die("--snpe-major 1 needs an SNPE 1.x SDK zip URL: pass --snpe-sdk-url <url> "
+            "or set SNPE1_SDK_URL (the 1.x SDK is login-gated on developer.qualcomm.com).")
     envs = {
         "DATE_IT": args.date_it, "EPOCHS": str(args.epochs), "BATCH": str(args.batch_size),
         "GEN_GT": "1" if args.gen_gt else "0",
@@ -554,7 +643,7 @@ def start_remote(host, port, args):
         "GT_ONLY": "1" if args.gt_only else "0",
         "WB_ENTITY": WANDB_ENTITY, "WB_PROJECT": WANDB_PROJECT,
         "WANDB_API_KEY": WANDB_KEY, "RUNPOD_API_KEY": API_KEY,
-        "SNPE_SDK_URL": snpe_url,
+        "SNPE_SDK_URL": snpe_url, "SNPE_MAJOR": snpe_major,
     }
     env_prefix = " ".join(f'{k}="{v}"' for k, v in envs.items())
     launch = (f"setsid nohup env {env_prefix} bash /workspace/_provision.sh "
@@ -730,6 +819,11 @@ def main():
                     help="direct download URL for the Qualcomm SNPE SDK zip "
                          "(enables .onnx -> .dlc conversion on the pod). "
                          "Can also be set via SNPE_SDK_URL env var.")
+    ap.add_argument("--snpe-major", type=int, choices=(1, 2), default=2,
+                    help="which SNPE converter generation to build the .dlc with. "
+                         "2 = QAIRT/SNPE 2.x (default). 1 = SNPE 1.x, which is what "
+                         "bukapilot's on-device runtime (namespace zdl) can actually "
+                         "load -- requires --snpe-sdk-url pointing at a 1.x SDK zip.")
     args = ap.parse_args()
 
     runpod = get_runpod()

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -118,7 +119,15 @@ fi
 # An explicit $SEGMENT always wins and forces a single segment.
 SEG_LIST="$WS/pred_segments.txt"
 : > "$SEG_LIST"
-if [ -n "$SEGMENT" ]; then
+# An explicit list uploaded by the launcher wins over everything. It lives in a
+# file rather than an env var because comma2k19 paths contain '|' and newlines
+# don't survive the env-prefixed launch command. The launcher deletes it when
+# not forcing, so a stale one from a previous run on this persistent volume
+# can't silently hijack the segment choice.
+if [ -s "$WS/pred_segments_forced.txt" ]; then
+  echo ">>> using the explicitly requested segment list"
+  grep -v '^[[:space:]]*$' "$WS/pred_segments_forced.txt" > "$SEG_LIST"
+elif [ -n "$SEGMENT" ]; then
   echo "$SEGMENT" > "$SEG_LIST"
 else
   find "$DATA" -name gt_distill.h5 -printf '%h\n' 2>/dev/null | sort > "$WS/pred_pool.txt"
@@ -163,6 +172,22 @@ while IFS= read -r SEG; do
     cp -r "$SEG/global_pose" "$D/" 2>/dev/null || echo ">>> [warn] global_pose copy failed for $SEG"
   else
     echo ">>> [warn] no global_pose in $SEG -- calibration will fall back to zero"
+  fi
+  # CAN data for the "driver is steering" badge. comma2k19 has no decoded
+  # steering-torque channel, so the badge decodes raw_can (~4 MB/segment) for
+  # openpilot's own STEERING_LKA command plus the EPS driver torque; the
+  # decoded steering_angle channel supplies the angle readout. radar and the
+  # rest are large and unused, so they are not staged.
+  if [ -d "$SEG/processed_log/CAN" ]; then
+    echo ">>>   CAN channels: $(ls "$SEG/processed_log/CAN" 2>/dev/null | tr '\n' ' ')"
+    mkdir -p "$D/processed_log/CAN"
+    for sig in raw_can steering_angle; do
+      [ -d "$SEG/processed_log/CAN/$sig" ] && \
+        cp -r "$SEG/processed_log/CAN/$sig" "$D/processed_log/CAN/" 2>/dev/null
+    done
+  else
+    echo ">>> [warn] no processed_log/CAN in $SEG -- driver-steering badge disabled"
+    echo ">>>   processed_log has: $(ls "$SEG/processed_log" 2>/dev/null | tr '\n' ' ')"
   fi
   SEG_ARGS="$SEG_ARGS $D"
   i=$((i+1))
@@ -225,6 +250,20 @@ if [ "${SHOW_REAL_GT:-0}" = "1" ]; then
   echo ">>> real GT panel: ON (sensor/GPS trajectory from global_pose)"
 fi
 
+# Steering-wheel badge on frames where the driver is steering (CAN torque).
+DRIVER_ARG=""
+if [ "${DRIVER_BADGE:-1}" = "1" ]; then
+  if [ -n "${DRIVER_TORQUE_THRESH:-}" ]; then
+    DRIVER_ARG="--driver-torque-thresh $DRIVER_TORQUE_THRESH"
+    echo ">>> driver-steering badge: ON (forced threshold $DRIVER_TORQUE_THRESH)"
+  else
+    echo ">>> driver-steering badge: ON (auto per-segment threshold)"
+  fi
+else
+  DRIVER_ARG="--no-driver-badge"
+  echo ">>> driver-steering badge: OFF"
+fi
+
 # Debug: calibration montage instead of a video.
 MONTAGE_ARG=""
 if [ -n "${MONTAGE_FRAME:-}" ]; then
@@ -251,7 +290,7 @@ CUDA_VISIBLE_DEVICES="" \
   OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}" \
   PYTHONPATH="$REPO" python -u test_prediction_video.py \
   --model "$LOCAL_MODEL" --segments $SEG_ARGS --output "$OUTPUT" \
-  --duration "$DURATION" --fps "$FPS" $TEACHER_ARG $MONTAGE_ARG $CALIB_ARG $REALGT_ARG \
+  --duration "$DURATION" --fps "$FPS" $TEACHER_ARG $MONTAGE_ARG $CALIB_ARG $REALGT_ARG $DRIVER_ARG \
   --openpilot-dir "$REPO/common"
 RC=$?
 
@@ -295,6 +334,29 @@ def _rpy_deg_to_rad_str(rpy_deg):
     return " ".join(f"{v:.6f}" for v in rad)
 
 
+def _unmangle_pod_path(p):
+    """Undo Git Bash's MSYS path conversion on a POD-side absolute path.
+
+    Run from Git Bash on Windows, an argument like `/workspace/comma2k19/...`
+    is rewritten to `C:/Program Files/Git/workspace/comma2k19/...` before
+    python ever sees it, and the pod then skips every segment as "not a
+    directory" -- which already cost one wasted pod boot. Every path we take
+    here is remote and absolute, so a value that doesn't start with '/' but
+    still contains a '/workspace/' component is unambiguously mangled.
+
+    (Setting MSYS_NO_PATHCONV=1 also prevents it, but that's easy to forget.)
+    """
+    q = p.replace("\\", "/")
+    if q.startswith("/"):
+        return p
+    m = re.search(r"(/workspace/.*)$", q)
+    if m:
+        print(f"[note] undoing MSYS path conversion:\n"
+              f"         {p}\n      -> {m.group(1)}")
+        return m.group(1)
+    return p
+
+
 def start_remote(host, port, args):
     """Upload the pod script and launch it detached, so the local process can
     stream logs from `POD_LOG` and cleanly Ctrl+C without killing the run."""
@@ -302,6 +364,17 @@ def start_remote(host, port, args):
     n = sync_local_files_to_pod(host, port, FILES_TO_SYNC, REPO_ROOT)
     if n == 0:
         die("no local files were uploaded -- check the paths in FILES_TO_SYNC.")
+
+    # Explicit multi-segment list (see POD_SCRIPT). Always clear a stale one --
+    # the network volume persists between runs.
+    if args.segments:
+        print(f"Forcing {len(args.segments)} explicitly requested segment(s)...")
+        if ssh_run(host, port, "cat > /workspace/pred_segments_forced.txt",
+                   stdin="\n".join(args.segments) + "\n") is None:
+            die("failed to upload the segment list over SSH")
+    else:
+        ssh_run(host, port, "rm -f /workspace/pred_segments_forced.txt",
+                quiet=True, check=False)
 
     print("Uploading pod script...")
     if ssh_run(host, port,
@@ -327,6 +400,10 @@ def start_remote(host, port, args):
         # Multi-segment: how many random GT segments to concatenate, and the
         # seed that makes the pick reproducible.
         "SHOW_REAL_GT": "1" if args.show_real_gt else "0",
+        # Steering-wheel badge for driver-steered frames (CAN driver torque).
+        "DRIVER_BADGE": "0" if args.no_driver_badge else "1",
+        "DRIVER_TORQUE_THRESH": ("" if args.driver_torque_thresh is None
+                                 else str(args.driver_torque_thresh)),
         "NUM_SEGMENTS": str(args.num_segments),
         "SEED": str(args.seed),
     }
@@ -457,6 +534,11 @@ def main():
     ap.add_argument("--segment", default=None,
                     help="absolute path on the pod to a specific segment dir "
                          "(default: pick one automatically that has GT)")
+    ap.add_argument("--segments", nargs="+", default=None, metavar="DIR",
+                    help="absolute paths on the pod to SEVERAL segment dirs, "
+                         "concatenated into one video in the order given. Overrides "
+                         "--num-segments/--seed random picking. Each segment gets its "
+                         "own calibration and a fresh recurrent state at the cut.")
     ap.add_argument("--duration", type=float, default=60.0, help="clip length in seconds")
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--output", default=None,
@@ -480,6 +562,15 @@ def main():
                     help="add a middle panel with the REAL driven trajectory from the "
                          "segment's sensor/GPS poses (comma2k19 global_pose), i.e. what "
                          "gt_real/generate_gt.py builds: teacher | GT | student.")
+    ap.add_argument("--no-driver-badge", action="store_true",
+                    help="don't overlay the steering-wheel badge on frames where the "
+                         "DRIVER is steering rather than openpilot (decoded from the "
+                         "segment's raw CAN). Default: badge ON.")
+    ap.add_argument("--driver-torque-thresh", type=float, default=None, metavar="T",
+                    help="|driver torque| above which the human counts as OVERRIDING "
+                         "while openpilot is engaged. Default 100 (openpilot's own "
+                         "Toyota STEER_THRESHOLD). Frames where openpilot is not "
+                         "steering at all count as driver-steered regardless.")
     ap.add_argument("--num-segments", type=int, default=1, metavar="N",
                     help="concatenate N randomly-chosen segments (each ~1 min) into one "
                          "video. Each gets its own calibration and a fresh recurrent "
@@ -487,6 +578,16 @@ def main():
     ap.add_argument("--seed", type=int, default=42,
                     help="seed for the random segment pick (default 42, reproducible)")
     args = ap.parse_args()
+
+    # Pod-side paths are always absolute; repair Git Bash's mangling and reject
+    # anything still not absolute rather than discovering it on the pod.
+    if args.segment:
+        args.segment = _unmangle_pod_path(args.segment)
+    if args.segments:
+        args.segments = [_unmangle_pod_path(s) for s in args.segments]
+    for s in ([args.segment] if args.segment else []) + (args.segments or []):
+        if not s.startswith("/"):
+            die(f"segment paths must be absolute paths ON THE POD, got: {s!r}")
 
     runpod = get_runpod()
     if args.list:

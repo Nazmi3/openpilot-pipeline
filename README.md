@@ -7,6 +7,23 @@ This repo attempts to re-create the data & training pipeline to allow training c
 ![compressed-model](https://user-images.githubusercontent.com/25569111/151782155-59a3fe8f-e12e-414b-9f58-1c699924eb1c.gif)
 
 
+## Documentation map
+
+This README is the single entry point — every other document in the repo is
+linked from here.
+
+| document | what's in it |
+|---|---|
+| **[doc/MODEL_INPUTS.md](doc/MODEL_INPUTS.md)** | **the model's four inputs, how each tensor is built, and which file on disk it comes from** |
+| [CLAUDE.md](CLAUDE.md) | working notes: the bukapilot deployment target, model output layout, RunPod operations, and the gotchas that cost real time |
+| [gt_distill/README.md](gt_distill/README.md) | generating distillation ground truth by running the teacher model over the dataset |
+| [gt_real/README.md](gt_real/README.md) | generating sensor-derived ground truth from ego-motion |
+| [doc/ONNX_to_DLC.md](doc/ONNX_to_DLC.md) | converting a trained model for the device |
+| [docker/README.md](docker/README.md) | container setup |
+| [common/transformations/README.md](common/transformations/README.md) | the coordinate frames (device, calibrated, road) the model works in |
+| [snpe248_gate0/README.md](snpe248_gate0/README.md) | SNPE 2.48 runtime investigation on the comma two |
+| [common/tools/lib/mkvparse/README.md](common/tools/lib/mkvparse/README.md) | vendored upstream utility |
+
 ## About
 
 The project is *in early development*. The ultimate goal is to create a community codebase for training end-to-end autonomous driving models.
@@ -45,6 +62,10 @@ Model inputs and outputs are described in detail in the [official repo](https://
 > **Note:** ONNX models are only available in the non-release branches, so we had to look for the right ONNX model by comparing the hashes of the corresponding DLC models to the one in desired release.
 
 ### Inputs
+
+> For the full picture — exact shapes, the YUV channel layout, calibration
+> handling, and which file on disk feeds each tensor — see
+> **[doc/MODEL_INPUTS.md](doc/MODEL_INPUTS.md)**.
 
 The primary input to the model is two consecutive camera frames, converted into YUV420 format (good description [here](https://github.com/peter-popov/unhack-openpilot#image-preprocessing)), reprojected and stacked into a tensor of shape `(N,12,128,256)`.
 
@@ -244,7 +265,7 @@ So far, the Likelihood loss worked much better, resulting in faster convergence 
 ## Suggested improvements (easy PR!)
 
 - [ ] Use drive calibration info from each segment for input transformation & predictions visualization
-- [ ] Filter out segments where the car is not moving. A camera-based detection method is already [implemented](gt_hacky/detect_moving_camera.py) (untested)
+- [ ] Filter out segments where the car is not moving. A camera-based detection method is already [implemented](gt_distill/detect_moving_camera.py) (untested)
 - [ ] Fault-tolerant data loader (do not crash training when a single video failed to read)
 - [ ] Speed up data loader via a better synchronization mechanism
 - [ ] Kill & restart (remembering the state) train/validation data loaders to reduce CPU-per-unit-of-batch-size cost
